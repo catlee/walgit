@@ -5985,6 +5985,7 @@ dependencies = [
  "google-cloud-auth",
  "google-cloud-gax",
  "google-cloud-storage",
+ "google-cloud-wkt",
  "hex",
  "http 1.5.0",
  "metrics",

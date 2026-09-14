@@ -20,7 +20,7 @@ use crate::{
 
 #[derive(Default)]
 pub struct MemoryStore {
-    objects: Mutex<BTreeMap<String, (Version, Bytes)>>,
+    objects: Mutex<BTreeMap<String, (Version, Bytes, std::time::SystemTime)>>,
     counter: AtomicU64,
     /// Optional artificial latency per op (tests of races/batching).
     pub latency: Option<std::time::Duration>,
@@ -96,10 +96,10 @@ impl ObjectStore for MemoryStore {
 
     async fn get(&self, key: &str, opts: GetOptions) -> Result<GetResult> {
         self.delay().await;
-        let (version, data) = {
+        let (version, data, updated) = {
             let g = self.objects.lock();
             match g.get(key) {
-                Some((v, d)) => (v.clone(), d.clone()),
+                Some((v, d, t)) => (v.clone(), d.clone(), *t),
                 None => return Err(StoreError::NotFound { key: key.into() }),
             }
         };
@@ -133,6 +133,7 @@ impl ObjectStore for MemoryStore {
                 key: key.into(),
                 size,
                 version,
+                updated: Some(updated),
             },
             body: util::once(slice),
         })
@@ -140,10 +141,11 @@ impl ObjectStore for MemoryStore {
 
     async fn head(&self, key: &str) -> Result<Option<ObjectMeta>> {
         self.delay().await;
-        Ok(self.objects.lock().get(key).map(|(v, d)| ObjectMeta {
+        Ok(self.objects.lock().get(key).map(|(v, d, t)| ObjectMeta {
             key: key.into(),
             size: d.len() as u64,
             version: v.clone(),
+            updated: Some(*t),
         }))
     }
 
@@ -151,7 +153,7 @@ impl ObjectStore for MemoryStore {
         let data = body_bytes(body).await?;
         self.delay().await;
         let mut g = self.objects.lock();
-        let current = g.get(key).map(|(v, _)| v.clone());
+        let current = g.get(key).map(|(v, ..)| v.clone());
         match (&opts.mode, &current) {
             (PutMode::Overwrite, _) | (PutMode::Create, None) => {}
             (PutMode::Create, Some(v)) => {
@@ -170,11 +172,13 @@ impl ObjectStore for MemoryStore {
         }
         let version = self.next_version();
         let size = data.len() as u64;
-        g.insert(key.to_owned(), (version.clone(), data));
+        let updated = std::time::SystemTime::now();
+        g.insert(key.to_owned(), (version.clone(), data, updated));
         Ok(ObjectMeta {
             key: key.into(),
             size,
             version,
+            updated: Some(updated),
         })
     }
 
@@ -195,7 +199,7 @@ impl ObjectStore for MemoryStore {
         {
             let g = self.objects.lock();
             for src in sources {
-                let (_, data) = g
+                let (_, data, _) = g
                     .get(src)
                     .ok_or_else(|| StoreError::NotFound { key: src.clone() })?;
                 buf.extend_from_slice(data);
@@ -204,13 +208,30 @@ impl ObjectStore for MemoryStore {
         self.put(dest, PutBody::Bytes(buf.freeze()), opts).await
     }
 
+    async fn bump_version(&self, key: &str) -> Result<Option<ObjectMeta>> {
+        self.delay().await;
+        let version = self.next_version();
+        let mut g = self.objects.lock();
+        let Some((v, d, t)) = g.get_mut(key) else {
+            return Ok(None);
+        };
+        *v = version.clone();
+        *t = std::time::SystemTime::now();
+        Ok(Some(ObjectMeta {
+            key: key.into(),
+            size: d.len() as u64,
+            version,
+            updated: Some(*t),
+        }))
+    }
+
     async fn delete(&self, key: &str, if_version: Option<Version>) -> Result<()> {
         self.delay().await;
         let mut g = self.objects.lock();
         match (g.get(key), if_version) {
             (None, None) => Ok(()),
             (None, Some(_)) => Err(StoreError::NotFound { key: key.into() }),
-            (Some((v, _)), Some(want)) if *v != want => Err(StoreError::PreconditionFailed {
+            (Some((v, ..)), Some(want)) if *v != want => Err(StoreError::PreconditionFailed {
                 key: key.into(),
                 current: Some(v.clone()),
             }),
@@ -231,10 +252,11 @@ impl ObjectStore for MemoryStore {
             .range(prefix.to_owned()..)
             .take_while(|(k, _)| k.starts_with(prefix))
             .filter(|(k, _)| start_after.is_none_or(|s| k.as_str() > s))
-            .map(|(k, (v, d))| ObjectMeta {
+            .map(|(k, (v, d, t))| ObjectMeta {
                 key: k.clone(),
                 size: d.len() as u64,
                 version: v.clone(),
+                updated: Some(*t),
             })
             .collect();
         futures::stream::iter(items.into_iter().map(Ok)).boxed()

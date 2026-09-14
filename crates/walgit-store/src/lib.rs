@@ -68,6 +68,11 @@ pub struct ObjectMeta {
     /// `Content-Range: bytes a-b/total` needs it).
     pub size: u64,
     pub version: Version,
+    /// Last-modified time when the backend reports it on this path: every LIST,
+    /// HEAD and metadata GET on GCS/S3/memory. `None` on header-only paths
+    /// (bulk HTTP range reads) and on S3 write responses. The GC sweep ages
+    /// deletion candidates from LIST with this field (`docs/GC.md` §4).
+    pub updated: Option<std::time::SystemTime>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -215,6 +220,15 @@ pub trait ObjectStore: Send + Sync + 'static {
     /// Delete. `if_version` = CAS delete. Deleting an absent object is `Ok(())`
     /// when unconditional and `NotFound` when conditional.
     async fn delete(&self, key: &str, if_version: Option<Version>) -> Result<()>;
+
+    /// Give `key` a version different from its immediately preceding version,
+    /// without changing its content. This is the fence D42's race-1 closure
+    /// rests on: a conditional delete holding a pre-bump version must fail
+    /// afterwards. Server-side where possible (GCS: compose-to-self mints a
+    /// generation; S3: a self-copy that flips the object between simple and
+    /// multipart representations, whose `ETag`s always differ; memory: a
+    /// counter). `Ok(None)` if the object does not exist.
+    async fn bump_version(&self, key: &str) -> Result<Option<ObjectMeta>>;
 
     /// Lexicographically ordered listing of keys with `prefix`, starting after
     /// `start_after` if given. Backends page internally.
@@ -510,6 +524,14 @@ impl ObjectStore for Prefixed {
             }
         }
         result.map(|m| self.strip(m))
+    }
+    async fn bump_version(&self, key: &str) -> Result<Option<ObjectMeta>> {
+        let full_key = self.full(key);
+        Ok(self
+            .inner
+            .bump_version(&full_key)
+            .await?
+            .map(|m| self.strip(m)))
     }
     async fn delete(&self, key: &str, if_version: Option<Version>) -> Result<()> {
         let instrument = !self.inner.is_prefixed();

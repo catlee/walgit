@@ -412,7 +412,7 @@ function EffectiveConfig({ d, full }: { d: SettingsDescribe; full: string }) {
             spellCheck={false}
             rows={Math.min(24, Math.max(8, text.split("\n").length + 1))}
             value={text}
-            placeholder={"# TOML overrides of [bundles], [maintenance], [compaction], [upstream]\n[bundles]\nmin_commits = 25\n"}
+            placeholder={"# TOML overrides of [bundles], [maintenance], [compaction], [gc], [upstream]\n[bundles]\nmin_commits = 25\n"}
             onChange={(e) => {
               setText(e.target.value);
               setDirty(true);

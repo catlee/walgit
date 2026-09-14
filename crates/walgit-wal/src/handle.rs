@@ -294,6 +294,7 @@ impl RepoHandle {
                     RemotePacks::open(
                         store,
                         &manifest,
+                        None,
                         &path,
                         hash,
                         blocks,

@@ -3,6 +3,7 @@
 //! bundle, and the selectable `Engine::Git` upload-pack fallback. See AGENTS.md
 //! D2 and docs/CONTRACT.md walgit-git.
 
+pub mod audit;
 pub mod follow;
 pub mod pkt;
 pub mod receive;
@@ -58,7 +59,7 @@ pub enum GitError {
     Protocol(String),
 }
 
-fn ge<E: std::error::Error + Send + Sync + 'static>(e: E) -> GitError {
+pub(crate) fn ge<E: std::error::Error + Send + Sync + 'static>(e: E) -> GitError {
     GitError::Gix(Box::new(e))
 }
 

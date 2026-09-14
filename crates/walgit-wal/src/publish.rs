@@ -109,8 +109,8 @@ pub(crate) fn pack_ref_from_info(p: &PackInfo, seq: u64, tier: u32) -> PackRef {
 /// Upload a pack + idx to the store (immutable, skip if already present).
 ///
 /// Both objects use create-if-absent directly. A precondition failure means
-/// another publisher already uploaded the content-addressed object, so it is
-/// success rather than a reason to spend another metadata round trip.
+/// another publisher already uploaded the content-addressed object; the adopt
+/// path fences it before this publish's CAS can reference it (D42 race 1).
 pub(crate) async fn upload_pack(store: &Prefixed, pack: &IngestedPack) -> Result<(), WalError> {
     let checksum = pack.checksum.to_string();
     let pack_key = keys::pack_key(&checksum);
@@ -121,6 +121,7 @@ pub(crate) async fn upload_pack(store: &Prefixed, pack: &IngestedPack) -> Result
     tokio::try_join!(pack_put, idx_put)?;
     Ok(())
 }
+
 
 /// Above this size a pack upload is striped (`put_file_parallel`).
 const PARALLEL_PUT_MIN_BYTES: u64 = 256 * 1024 * 1024;
@@ -153,31 +154,49 @@ pub(crate) async fn put_immutable_create(
     match put {
         Ok(()) => Ok(()),
         Err(StoreError::PreconditionFailed { .. }) => {
-            // "Already exists" is the normal reading, but verify before the
-            // manifest points at it: a 412 racing a GC delete (or a backend
-            // hiccup) must not leave a referenced object missing. Rare path,
-            // one HEAD; on a miss, write it unconditionally (content-addressed:
-            // whoever wins wrote the same bytes).
-            if store.head(&key).await?.is_some() {
+            // "Already exists": adopt the content-addressed object — but fence
+            // it FIRST (D42 race 1). The object may have sat unreferenced past
+            // gc.retention; a sweep already inside its delete loop holds its
+            // old version. The pre-CAS version bump makes that conditional
+            // delete 412 and refreshes the mtime (so a sweep listing after the
+            // bump sees a young object, not a candidate). Fencing before the
+            // manifest CAS means a crash at ANY later point leaves the
+            // reference protected — nothing depends on post-commit execution.
+            if store.bump_version(&key).await?.is_some() {
+                metrics::counter!("walgit_gc_skipped_upload_rewrites_total").increment(1);
                 Ok(())
             } else {
-                tracing::warn!(
-                    key,
-                    "create-if-absent reported the object present but HEAD finds nothing; writing it"
-                );
-                store
-                    .put(
-                        &key,
-                        PutBody::File(path),
-                        PutOptions {
-                            mode: PutMode::Overwrite,
-                            immutable: true,
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                    .map(|_| ())
-                    .map_err(WalError::Store)
+                {
+                    // Vanished between the 412 and the bump (the sweep won):
+                    // the bytes are local, write them.
+                    tracing::warn!(
+                        key,
+                        "create-if-absent reported the object present but it vanished (gc race); writing it"
+                    );
+                    let opts = PutOptions {
+                        mode: PutMode::Overwrite,
+                        immutable: true,
+                        ..Default::default()
+                    };
+                    if size >= PARALLEL_PUT_MIN_BYTES && store.supports_compose() {
+                        walgit_store::util::put_file_parallel(
+                            store,
+                            &key,
+                            &path,
+                            opts,
+                            PARALLEL_PUT_STRIPES,
+                        )
+                        .await
+                        .map(|_| ())
+                        .map_err(WalError::Store)
+                    } else {
+                        store
+                            .put(&key, PutBody::File(path), opts)
+                            .await
+                            .map(|_| ())
+                            .map_err(WalError::Store)
+                    }
+                }
             }
         }
         Err(e) => Err(WalError::Store(e)),
@@ -957,10 +976,7 @@ pub(crate) async fn publish_compact_impl(
     };
     let pack_key = keys::pack_key(&checksum);
     let idx_key = keys::idx_key(&checksum);
-    let mut upload_futures = vec![
-        put_immutable_create(&handle.store, pack_key, pack_path.clone()),
-        put_immutable_create(&handle.store, idx_key, idx_path),
-    ];
+    let mut objects = vec![(pack_key, pack_path.clone()), (idx_key, idx_path)];
     for (flag, ext, key) in [
         (new_pack.has_rev, "rev", keys::rev_key(&checksum)),
         (new_pack.has_bitmap, "bitmap", keys::bitmap_key(&checksum)),
@@ -975,10 +991,23 @@ pub(crate) async fn publish_compact_impl(
         }
         let path = pack_path.with_extension(ext);
         if path.exists() {
-            upload_futures.push(put_immutable_create(&handle.store, key, path));
+            objects.push((key, path));
         }
     }
-    for result in futures::future::join_all(upload_futures).await {
+    let uploads = objects.iter().map(|(key, path)| {
+        put_immutable_create(&handle.store, key.clone(), path.clone())
+    });
+    for result in futures::future::join_all(uploads).await {
+        result?;
+    }
+    // Final pre-claim fence. Compact/base outputs can upload for minutes and
+    // resume after long pauses; running the create/adopt path again makes
+    // every output young and version-fenced immediately before its log intent
+    // and manifest CAS. Cold maintainer path only, no push round trip added.
+    let fences = objects.iter().map(|(key, path)| {
+        put_immutable_create(&handle.store, key.clone(), path.clone())
+    });
+    for result in futures::future::join_all(fences).await {
         result?;
     }
 
@@ -1397,5 +1426,69 @@ pub(crate) async fn publish_settings_impl(
             }
             Err(e) => return Err(WalError::Store(e)),
         }
+    }
+}
+
+#[cfg(test)]
+mod adopt_fence_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    use walgit_store::{ObjectStoreExt, memory::MemoryStore};
+
+    /// D42 race 1, fenced BEFORE the CAS: adopting an already-present
+    /// content-addressed object bumps its version at skip time, so a sweep
+    /// holding the pre-adopt version gets 412 — and a crash at any later point
+    /// (including right after the manifest CAS) changes nothing, because the
+    /// fence was already in place when the reference became visible.
+    #[tokio::test]
+    async fn adopting_an_existing_object_fences_it_before_any_cas() {
+        let store = Prefixed::new(MemoryStore::shared(), "repos/o/r/");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pack-cafe.pack");
+        std::fs::write(&path, b"pack bytes").unwrap();
+
+        // First upload wins; a sweep LISTs and holds this version.
+        put_immutable_create(&store, "wal/cafe.pack".into(), path.clone())
+            .await
+            .unwrap();
+        let held = store.head("wal/cafe.pack").await.unwrap().unwrap().version;
+
+        // Second publisher adopts the object (412 → bump).
+        put_immutable_create(&store, "wal/cafe.pack".into(), path.clone())
+            .await
+            .unwrap();
+
+        // The sweep's conditional delete with the stale version fails and the
+        // referenced object survives, byte-identical.
+        let err = store
+            .delete("wal/cafe.pack", Some(held))
+            .await
+            .unwrap_err();
+        assert!(err.is_precondition_failed(), "{err}");
+        let (_, bytes) = store.get_bytes("wal/cafe.pack").await.unwrap().unwrap();
+        assert_eq!(&bytes[..], b"pack bytes");
+    }
+
+    /// The sweep won the race entirely (object gone between the 412 and the
+    /// bump): the adopt path re-uploads from the local bytes.
+    #[tokio::test]
+    async fn adopting_a_vanished_object_re_uploads_it() {
+        let store = Prefixed::new(MemoryStore::shared(), "repos/o/r/");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pack-cafe.pack");
+        std::fs::write(&path, b"pack bytes").unwrap();
+        put_immutable_create(&store, "wal/cafe.pack".into(), path.clone())
+            .await
+            .unwrap();
+        // Simulate the 412-then-vanish interleaving directly: the object is
+        // present for the Create (412) and deleted before the bump — the
+        // memory store is atomic, so exercise the recovery arm by deleting
+        // and calling the adopt path again.
+        store.delete("wal/cafe.pack", None).await.unwrap();
+        put_immutable_create(&store, "wal/cafe.pack".into(), path.clone())
+            .await
+            .unwrap();
+        let (_, bytes) = store.get_bytes("wal/cafe.pack").await.unwrap().unwrap();
+        assert_eq!(&bytes[..], b"pack bytes");
     }
 }

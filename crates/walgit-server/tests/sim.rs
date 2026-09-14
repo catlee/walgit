@@ -35,6 +35,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use futures::StreamExt;
 use prost::Message;
 use walgit_git::{IngestOptions, ObjectFormat, RepoId};
 use walgit_proto::v1::{EntryKind, Manifest, RefTransaction, RefUpdate};
@@ -2871,3 +2872,264 @@ async fn sim_cache_pressure_keeps_pinned_repos_and_refuses_too_large() {
 
 #[allow(dead_code)]
 fn _unused(_: WalError) {}
+
+// ---------------------------------------------------------------------------
+// GC (D42): sweep safety under chaos, convergence, and healthy budgets
+// ---------------------------------------------------------------------------
+
+/// Oracle: everything the truth manifest references exists in the bucket — a
+/// gc sweep must never have deleted a referenced object, whatever the
+/// interleaving of pushes, compactions, audits, sweeps, crashes and lost
+/// responses. (`check_truth` covers refs/log consistency; this covers bytes.)
+async fn check_gc_truth(c: &Cluster) -> Result<()> {
+    use walgit_proto::keys;
+    let manifest = c.truth_manifest().await?;
+    let prefix = c.repo_prefix();
+    let must = |key: String| {
+        let truth = c.truth.clone();
+        let prefix = prefix.clone();
+        async move {
+            ensure!(
+                truth.head(&format!("{prefix}{key}")).await?.is_some(),
+                "referenced {key} missing from the bucket (over-deletion)"
+            );
+            Ok(())
+        }
+    };
+    for p in &manifest.packs {
+        must(keys::pack_key(&p.checksum)).await?;
+        must(keys::idx_key(&p.checksum)).await?;
+        if p.has_rev {
+            must(keys::rev_key(&p.checksum)).await?;
+        }
+        if p.has_bitmap {
+            must(keys::bitmap_key(&p.checksum)).await?;
+        }
+        if p.has_commit_graph {
+            must(keys::commit_graph_key(&p.checksum)).await?;
+        }
+    }
+    for s in &manifest.log_segments {
+        must(keys::log_segment_key(s.first_seq)).await?;
+    }
+    if let Some(cp) = &manifest.checkpoint {
+        must(cp.key.clone()).await?;
+        must(keys::checkpoint_refs_key(cp.seq)).await?;
+    }
+    Ok(())
+}
+
+/// The gc-audit op's core, harness-side (the op needs an `AppState`): Serve
+/// sync, walk against the live idx set, verdict written to gc/audit.pb.
+async fn sim_audit(inst: &Instance, id: &RepoId) -> Result<u64> {
+    let h = inst.open(id).await?;
+    let guard = h.sync().await?;
+    let (manifest, roots) = guard.audit_snapshot().await?;
+    let seq = manifest.head_seq;
+    let idx = walgit_wal::gc::live_indexes(
+        &h,
+        &manifest,
+        &walgit_wal::progress::Reporter::none(),
+    )
+    .await?;
+    let local = h.local().clone();
+    let out = tokio::task::spawn_blocking(move || {
+        let probe = |oid: &walgit_git::gix_hash::oid| idx.contains(oid);
+        walgit_git::audit::connectivity_walk_with_refs(
+            &local,
+            &roots,
+            &probe,
+            100_000,
+            &|_| {},
+        )
+    })
+    .await??;
+    let report = walgit_proto::v1::FsckReport {
+        seq,
+        at: Some(walgit_proto::time::now()),
+        host: inst.name.clone(),
+        missing_total: out.missing_total,
+        missing: out.missing.iter().map(ToString::to_string).collect(),
+        problems: 0,
+        elapsed_secs: 0.0,
+        repaired_seq: 0,
+    };
+    h.store()
+        .put_bytes(
+            walgit_proto::keys::GC_AUDIT,
+            report.encode_to_vec(),
+            walgit_store::PutMode::Overwrite,
+        )
+        .await?;
+    Ok(out.missing_total)
+}
+
+async fn run_gc_chaos(seed: u64) -> Result<()> {
+    let mut c = Cluster::new(seed, 2).await?;
+    // A dedicated gc host with an aggressive config: everything unreferenced
+    // matures immediately, so every sweep exercises the gate + deletion.
+    let gc = c.add_instance("gc", &|cfg| {
+        cfg.gc.retention = Duration::ZERO;
+        cfg.gc.sweep_interval = Duration::ZERO;
+    });
+    let mut rng = Lcg(seed.wrapping_mul(7).wrapping_add(3));
+    let mut pushers: Vec<Pusher> = (0..2).map(Pusher::new).collect();
+    for inst in &c.instances {
+        inst.link.set(FaultPlan::chaos(0.04));
+    }
+    let op_timeout = Duration::from_secs(10);
+    for round in 0..12u64 {
+        for p in &mut pushers {
+            let i = rng.below_usize(2);
+            let _ = p.push_once(&c.instances[i], &c.id, op_timeout).await?;
+        }
+        // Compactions create superseded packs — gc's raw material — and a
+        // checkpoint afterwards gives the sweep its horizon reference.
+        if round % 3 == 2
+            && let Ok(h) = c.instances[rng.below_usize(2)].open(&c.id).await
+        {
+            let cfg = c.instances[0].cfg.clone();
+            let _ = tokio::time::timeout(
+                op_timeout,
+                walgit_server::ops::compact_repo(
+                    &h,
+                    &cfg,
+                    walgit_server::ops::CompactRequest {
+                        force: true,
+                        rebuild_base: false,
+                    },
+                    &walgit_server::ops::noop_log,
+                ),
+            )
+            .await;
+            let _ = tokio::time::timeout(op_timeout, h.write_checkpoint()).await;
+        }
+        // Audit + sweep under chaos; failures are tolerated, corruption is not.
+        let _ = tokio::time::timeout(op_timeout, sim_audit(&c.instances[gc], &c.id)).await;
+        if let Ok(h) = c.instances[gc].open(&c.id).await {
+            let _ = tokio::time::timeout(
+                op_timeout,
+                walgit_wal::gc::sweep(&h, std::time::SystemTime::now(), &|_| {}),
+            )
+            .await;
+        }
+        // The gc host crashes mid-anything and comes back with the same config.
+        if rng.chance(0.25) {
+            c.restart_keep_disk(gc, &|cfg| {
+                cfg.gc.retention = Duration::ZERO;
+                cfg.gc.sweep_interval = Duration::ZERO;
+            });
+            c.instances[gc].link.set(FaultPlan::chaos(0.04));
+        }
+        // The bytes oracle holds at every step.
+        if let Err(e) = check_gc_truth(&c).await {
+            eprintln!("{}", c.dump_traces());
+            return Err(e.context(format!("gc truth after round {round}")));
+        }
+    }
+    let acked: usize = pushers.iter().map(|p| p.acked.len()).sum();
+    ensure!(acked > 0, "chaos too strong: nothing was ever acknowledged");
+
+    // Heal and converge: checkpoint (the horizon reference at the final
+    // head) → audit → sweep, twice, leaves no unreferenced pack behind
+    // (retention 0) and never touches a referenced byte.
+    for inst in &c.instances {
+        inst.link.heal();
+    }
+    // One healthy writer burns past any uncommitted log slots left by chaos;
+    // until then their pack intent is deliberately protected (the publisher
+    // could still resume). Once head passes them they become ordinary orphans.
+    ensure!(
+        pushers[0]
+            .push_once(&c.instances[0], &c.id, op_timeout)
+            .await?
+    );
+    for _ in 0..2 {
+        let h = c.instances[gc].open(&c.id).await?;
+        h.write_checkpoint().await?;
+        sim_audit(&c.instances[gc], &c.id).await?;
+        walgit_wal::gc::sweep(&h, std::time::SystemTime::now(), &|_| {}).await?;
+    }
+    check_gc_truth(&c).await.context("gc truth after healing")?;
+    check_truth(&c, &pushers)
+        .await
+        .context("wal truth after gc convergence")?;
+    let manifest = c.truth_manifest().await?;
+    let live: std::collections::HashSet<String> = manifest
+        .packs
+        .iter()
+        .map(|p| walgit_proto::keys::pack_key(&p.checksum))
+        .collect();
+    let mut stream = c.truth.list(&format!("{}wal/", c.repo_prefix()), None);
+    let mut leftovers = 0usize;
+    while let Some(m) = stream.next().await {
+        let m = m?;
+        let key = m.key.trim_start_matches(&c.repo_prefix()).to_string();
+        if std::path::Path::new(&key)
+            .extension()
+            .is_some_and(|ext| ext == "pack")
+            && !live.contains(&key)
+        {
+            leftovers += 1;
+        }
+    }
+    ensure!(
+        leftovers == 0,
+        "{leftovers} unreferenced pack(s) survived convergence (retention 0, clean audit)"
+    );
+    // And the repository still works: one more push lands.
+    ensure!(
+        pushers[0]
+            .push_once(&c.instances[0], &c.id, op_timeout)
+            .await?
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gc_sweep_safety_under_chaos() {
+    for seed in seeds() {
+        run_gc_chaos(seed)
+            .await
+            .unwrap_or_else(|e| panic!("[seed {seed}] {e:#}"));
+    }
+}
+
+/// ROUNDTRIPS: a steady-state sweep is 1 cond GET (refs sync) + gc/audit ∥
+/// fsck GETs + 4 LISTs + the horizon-checkpoint GET, no writes — and only a
+/// pass that will delete pays the fresh manifest re-read (race-1 guard) plus
+/// its conditional DELETEs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn healthy_gc_sweep_budget() -> Result<()> {
+    let mut c = Cluster::new(23, 1).await?;
+    let gc = c.add_instance("gc-budget", &|cfg| {
+        cfg.gc.retention = Duration::ZERO;
+        // The budget is the sweep's own requests, not a background Serve
+        // prefetch spawned by the preceding refs open.
+        cfg.wal.prefetch_packs = false;
+    });
+    let mut p = Pusher::new(0);
+    for _ in 0..2 {
+        ensure!(
+            p.push_once(&c.instances[0], &c.id, Duration::from_secs(10))
+                .await?
+        );
+    }
+    let h = c.instances[gc].open(&c.id).await?;
+    h.write_checkpoint().await?;
+    // Warm-up sweep: absorbs any straggling background request from the
+    // pushes so the measured pass is exactly one sweep's own requests. The
+    // measured pass is the steady state: 1 cond GET (refs) + gc/audit GET +
+    // 4 LISTs + 1 committed-checkpoint GET + 1 retained-log GET = 8 requests;
+    // the verdict/listings and retained-log GETs each share one sequential
+    // round, no writes.
+    let _ = walgit_wal::gc::sweep(&h, std::time::SystemTime::now(), &|_| {}).await?;
+    let before = c.instances[gc].link.stats().ops.load(Ordering::Relaxed);
+    let out = walgit_wal::gc::sweep(&h, std::time::SystemTime::now(), &|_| {}).await?;
+    let ops = c.instances[gc].link.stats().ops.load(Ordering::Relaxed) - before;
+    ensure!(out.deleted == 0, "steady state deletes nothing: {out:?}");
+    ensure!(out.horizon_seq > 0, "horizon checkpoint found: {out:?}");
+    ensure!(ops <= 8, "steady-state sweep used {ops} requests, budget 8");
+    eprintln!("healthy gc sweep (no deletions): {ops} requests");
+    Ok(())
+}

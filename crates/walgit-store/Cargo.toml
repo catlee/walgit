@@ -6,7 +6,7 @@ license.workspace = true
 
 [features]
 default = ["gcs", "s3"]
-gcs = ["dep:google-cloud-storage", "dep:google-cloud-gax", "dep:google-cloud-auth", "dep:reqwest"]
+gcs = ["dep:google-cloud-storage", "dep:google-cloud-gax", "dep:google-cloud-wkt", "dep:google-cloud-auth", "dep:reqwest"]
 s3 = ["dep:aws-config", "dep:aws-sdk-s3", "dep:aws-smithy-types", "dep:reqwest"]
 
 [dependencies]
@@ -31,6 +31,7 @@ hex.workspace = true
 http.workspace = true
 google-cloud-storage = { workspace = true, optional = true }
 google-cloud-gax = { workspace = true, optional = true }
+google-cloud-wkt = { workspace = true, optional = true }
 google-cloud-auth = { workspace = true, optional = true }
 aws-config = { workspace = true, optional = true }
 aws-sdk-s3 = { workspace = true, optional = true }

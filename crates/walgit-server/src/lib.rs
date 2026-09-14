@@ -103,6 +103,10 @@ pub struct AppState {
     pub follow: follow::FollowStatuses,
     /// In-process TLS (standalone, D39); `None` behind an edge (h2c).
     pub tls: Option<Arc<tls::Tls>>,
+    /// D42: per-repo gc scheduling hints (last sweep, gated candidates
+    /// awaiting an audit). Memory-only by design: losing it on a restart just
+    /// re-runs one idempotent sweep — the durable truth is the bucket.
+    pub gc_sched: parking_lot::Mutex<std::collections::HashMap<String, maintain::GcSched>>,
 }
 
 impl AppState {
@@ -136,6 +140,7 @@ impl AppState {
             bridge,
             follow: follow::FollowStatuses::default(),
             tls,
+            gc_sched: parking_lot::Mutex::new(std::collections::HashMap::new()),
         }))
     }
 }

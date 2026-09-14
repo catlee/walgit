@@ -18,14 +18,17 @@ Read `AGENTS.md` first (design §1–§2, decisions §3; the original layout/pha
 ## Existing (do not rewrite; extend only)
 - `walgit-proto`: prost types from `proto/walgit/v1/wal.proto` (Manifest, LogSegmentRef, LogEntry, PackRef,
   RefTransaction/RefUpdate, Checkpoint(+Ref), RefSnapshot/Ref, Lease, BundleList/BundleEntry); `keys::*`;
-  `frame::{encode_entries,decode_entries}` (uvarint-framed log encoding); `time::*`; `keys::POLICY` / `policy_key` (`policy.json` rule language, `docs/POLICY.md`).
+  `frame::{encode_entries,decode_entries}` (uvarint-framed log encoding); `time::*`; `keys::POLICY` / `policy_key`
+  (`policy.json` rule language, `docs/POLICY.md`). D42: every committed `Checkpoint` points to its `previous`
+  committed `CheckpointRef`; manifest current + that immutable chain is GC/materialize provenance. Abandoned
+  checkpoint objects are not in the chain.
 - `walgit-store`: `ObjectStore` trait (`Version` opaque CAS token, `GetOptions{if_none_match,if_match,range}`,
   `GetResult::{NotModified,Object}`, `PutMode::{Overwrite,Create,Update(Version)}`, `PutBody::{Bytes,Stream,File}`,
   `PutOptions`, `StoreError::{NotFound,PreconditionFailed{current},Retryable,InvalidArgument,Other}`,
   `ObjectStoreExt`, `Prefixed`, `memory::MemoryStore`, `util::{collect,once,file_stream,backoff,retry}`),
   placeholder modules `coord.rs`, `gcs.rs`, `s3.rs`.
 - `walgit-config`: `Config` for walgit.toml (+ `WALGIT__` env overrides, `PORT`); `Config::with_settings` accepts
-  only `[bundles]`, `[maintenance]`, `[compaction]` and `[upstream]` in repo-scoped settings.
+  only `[bundles]`, `[maintenance]`, `[compaction]`, `[gc]` and `[upstream]` in repo-scoped settings.
 
 ## walgit-git (owner: GitEngine)
 

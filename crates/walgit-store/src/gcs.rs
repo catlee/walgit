@@ -333,6 +333,7 @@ impl GcsStore {
             key: obj.name.clone(),
             size: obj.size.max(0).cast_unsigned(),
             version: gen_version(obj.generation),
+            updated: obj.update_time.as_ref().and_then(ts_to_system),
         }
     }
 
@@ -740,6 +741,7 @@ impl ObjectStore for GcsStore {
                 key: key.to_owned(),
                 size,
                 version: generation.map_or_else(|| Version::new(""), gen_version),
+                updated: None,
             };
             return Ok(GetResult::Object { meta, body });
         }
@@ -771,6 +773,8 @@ impl ObjectStore for GcsStore {
             key: key.to_owned(),
             size: obj.size.max(0).cast_unsigned(),
             version: gen_version(obj.generation),
+            // `ObjectHighlights` (streaming read) carries no update time.
+            updated: None,
         };
 
         Ok(GetResult::Object {
@@ -865,6 +869,28 @@ impl ObjectStore for GcsStore {
             Err(_) => return Err(deadline_error("compose", dest, PUT_MIN_DEADLINE)),
         };
         Ok(Self::meta_from_object(&obj))
+    }
+
+    async fn bump_version(&self, key: &str) -> Result<Option<ObjectMeta>> {
+        // Compose-to-self: same bytes, new generation, no data movement.
+        use google_cloud_storage::model::compose_object_request::SourceObject;
+        let destination = google_cloud_storage::model::Object::new()
+            .set_bucket(self.bucket_resource.clone())
+            .set_name(key.to_owned());
+        let builder = self
+            .control
+            .compose_object()
+            .set_destination(destination)
+            .set_source_objects(vec![SourceObject::new().set_name(key.to_owned())]);
+        let obj = match tokio::time::timeout(PUT_MIN_DEADLINE, builder.send()).await {
+            Ok(Ok(obj)) => obj,
+            Ok(Err(e)) => {
+                let e = map_error(key, e);
+                return if e.is_not_found() { Ok(None) } else { Err(e) };
+            }
+            Err(_) => return Err(deadline_error("bump", key, PUT_MIN_DEADLINE)),
+        };
+        Ok(Some(Self::meta_from_object(&obj)))
     }
 
     async fn delete(&self, key: &str, if_version: Option<Version>) -> Result<()> {
@@ -1062,6 +1088,13 @@ impl ObjectStore for GcsStore {
 /// Render a GCS generation (i64) as a decimal string Version.
 fn gen_version(generation: i64) -> Version {
     Version::new(generation.to_string())
+}
+
+/// GCS `update_time` → [`std::time::SystemTime`]. Pre-epoch (never in practice) → `None`.
+fn ts_to_system(t: &google_cloud_wkt::Timestamp) -> Option<std::time::SystemTime> {
+    let secs = u64::try_from(t.seconds()).ok()?;
+    let nanos = u32::try_from(t.nanos()).unwrap_or(0);
+    Some(std::time::UNIX_EPOCH + std::time::Duration::new(secs, nanos))
 }
 
 /// Parse a Version back into a generation (i64).

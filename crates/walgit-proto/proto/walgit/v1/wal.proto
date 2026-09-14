@@ -191,6 +191,11 @@ message Checkpoint {
   string bundle_key = 6;
   google.protobuf.Timestamp created_at = 7;
   string writer = 8;
+  // D42: the previous COMMITTED checkpoint. The manifest points only at the
+  // latest; following this immutable chain proves provenance (an abandoned
+  // import checkpoint is not in it) and lets GC/materialize choose an older
+  // retained checkpoint without a mutable index.
+  CheckpointRef previous = 9;
 }
 
 message CheckpointRef {

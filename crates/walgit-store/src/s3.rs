@@ -21,10 +21,10 @@
 //!
 //! ## Conditional DELETE
 //!
-//! S3 has no native conditional delete. We emulate via HEAD (read `ETag`) +
-//! compare + DELETE, documenting the inherent check-then-act race: a
-//! concurrent writer could replace the object between HEAD and DELETE.
-//! Acceptable for walgit's lease-guarded semantics.
+//! Native `If-Match: <etag>` on `DeleteObject` (S3 conditional requests): the
+//! version check and the delete are one atomic operation — D42's race-1 fence
+//! depends on it. A preceding HEAD only supplies the contract's
+//! NotFound-vs-412 distinction for absent keys.
 //!
 //! ## Multipart upload
 //!
@@ -42,7 +42,7 @@
 //! See the compatibility notes at the bottom of this file.
 
 use std::ops::Range;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::config::Credentials;
@@ -177,6 +177,7 @@ impl S3Store {
                     key: key.into(),
                     size: total.or(content_length).unwrap_or(0),
                     version,
+                    updated: None,
                 };
                 let body = resp
                     .bytes_stream()
@@ -353,6 +354,7 @@ impl ObjectStore for S3Store {
                     key: key.into(),
                     size,
                     version: Version::new(etag.as_deref().unwrap_or("")),
+                    updated: out.last_modified().and_then(|t| SystemTime::try_from(*t).ok()),
                 }))
             }
             Err(err) => {
@@ -409,6 +411,7 @@ impl ObjectStore for S3Store {
                     key: key.into(),
                     size: len,
                     version: Version::new(etag.as_deref().unwrap_or("")),
+                    updated: None,
                 })
             }
             Err(e) => {
@@ -424,22 +427,207 @@ impl ObjectStore for S3Store {
         }
     }
 
+    async fn bump_version(&self, key: &str) -> Result<Option<ObjectMeta>> {
+        // S3's Version is the ETag, and an ETag is a pure function of content
+        // and part layout — re-uploading identical bytes bumps nothing. So the
+        // bump flips the object's *representation*: a simple object (ETag =
+        // content MD5) becomes a 1-part multipart object (ETag `<h>-1`); a
+        // multipart `<h>-N` object is recomposed as N+1 parts when the size
+        // allows, else copied back to a simple object. The new ETag always
+        // differs from the immediately preceding one — the contract's
+        // guarantee — but content-derived ETags give small objects (< ~10 MiB)
+        // only two representations, so versions there cycle with period 2:
+        // two bumps of one key while a single sweep sits inside its delete
+        // loop could re-arm its stale version (needs two publishers committing
+        // the same content-addressed key within seconds — accept, or enable
+        // bucket versioning for an airtight S3). Server-side copies only.
+        const MIN_PART: u64 = 5 * 1024 * 1024;
+        const MAX_COPY_PART: u64 = 5 * 1024 * 1024 * 1024 - 1; // UploadPartCopy / CopyObject limit
+        let Some(meta) = self.head(key).await? else {
+            return Ok(None);
+        };
+        let current_parts: Option<u64> = meta
+            .version
+            .as_str()
+            .rsplit_once('-')
+            .and_then(|(_, n)| n.parse().ok());
+        // Smallest part count > the current one whose non-last parts fit
+        // MIN_PART..=MAX_COPY_PART; 0 = go simple (CopyObject).
+        let target_parts: u64 = match current_parts {
+            None => 1,
+            Some(n) => {
+                let max_parts = (meta.size / MIN_PART).max(1);
+                let min_parts = meta.size.div_ceil(MAX_COPY_PART).max(1);
+                let want = (n + 1).max(min_parts);
+                if want <= max_parts { want } else { 0 }
+            }
+        };
+        if target_parts == 0 {
+            // Small multipart object: back to a simple representation. A
+            // self-copy must change something: replace metadata with a nonce.
+            let out = self
+                .client
+                .copy_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .copy_source(format!("{}/{}", self.bucket, crate::util::encode_path(key)))
+                .metadata_directive(aws_sdk_s3::types::MetadataDirective::Replace)
+                .metadata("walgit-bump", uuid::Uuid::new_v4().to_string())
+                .cache_control("public, max-age=31536000, immutable")
+                .send()
+                .await
+                .map_err(|e| classify_error("s3 bump copy", &e))?;
+            let etag = out
+                .copy_object_result()
+                .and_then(|r| r.e_tag())
+                .map(|s| s.trim_matches('"').to_owned());
+            return Ok(Some(ObjectMeta {
+                key: key.into(),
+                size: meta.size,
+                version: Version::new(etag.as_deref().unwrap_or("")),
+                updated: None,
+            }));
+        }
+        let upload = self
+            .client
+            .create_multipart_upload()
+            .bucket(&self.bucket)
+            .key(key)
+            .cache_control("public, max-age=31536000, immutable")
+            .send()
+            .await
+            .map_err(|e| classify_error("s3 bump create multipart", &e))?;
+        let upload_id = upload
+            .upload_id()
+            .ok_or_else(|| {
+                StoreError::other(anyhow::anyhow!("no upload_id from CreateMultipartUpload"))
+            })?
+            .to_owned();
+        let part_size = meta.size.div_ceil(target_parts).max(MIN_PART);
+        let result: Result<Vec<aws_sdk_s3::types::CompletedPart>> = async {
+            let mut parts = Vec::new();
+            if meta.size == 0 {
+                // A zero-byte object cannot be range-copied: one empty part.
+                let part = self
+                    .client
+                    .upload_part()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .upload_id(&upload_id)
+                    .part_number(1)
+                    .body(aws_sdk_s3::primitives::ByteStream::from_static(b""))
+                    .send()
+                    .await
+                    .map_err(|e| classify_error("s3 bump empty part", &e))?;
+                parts.push(
+                    aws_sdk_s3::types::CompletedPart::builder()
+                        .part_number(1)
+                        .set_e_tag(part.e_tag().map(ToOwned::to_owned))
+                        .build(),
+                );
+                return Ok(parts);
+            }
+            let mut pos = 0u64;
+            let mut part_number = 1i32;
+            while pos < meta.size {
+                let end = (pos + part_size).min(meta.size);
+                let part = self
+                    .client
+                    .upload_part_copy()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .upload_id(&upload_id)
+                    .part_number(part_number)
+                    .copy_source(format!("{}/{}", self.bucket, crate::util::encode_path(key)))
+                    .copy_source_range(format!("bytes={}-{}", pos, end - 1))
+                    .send()
+                    .await
+                    .map_err(|e| classify_error("s3 bump part copy", &e))?;
+                let etag = part
+                    .copy_part_result()
+                    .and_then(|r| r.e_tag())
+                    .map(ToOwned::to_owned);
+                parts.push(
+                    aws_sdk_s3::types::CompletedPart::builder()
+                        .part_number(part_number)
+                        .set_e_tag(etag)
+                        .build(),
+                );
+                part_number += 1;
+                pos = end;
+            }
+            Ok(parts)
+        }
+        .await;
+        let parts = match result {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = self.abort_multipart(key, &upload_id).await;
+                return Err(e);
+            }
+        };
+        let resp = self
+            .client
+            .complete_multipart_upload()
+            .bucket(&self.bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .multipart_upload(
+                aws_sdk_s3::types::CompletedMultipartUpload::builder()
+                    .set_parts(Some(parts))
+                    .build(),
+            )
+            .send()
+            .await;
+        let resp = match resp {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = self.abort_multipart(key, &upload_id).await;
+                return Err(classify_error("s3 bump complete multipart", &e));
+            }
+        };
+        let etag = resp.e_tag().map(|s| s.trim_matches('"').to_owned());
+        Ok(Some(ObjectMeta {
+            key: key.into(),
+            size: meta.size,
+            version: Version::new(etag.as_deref().unwrap_or("")),
+            updated: None,
+        }))
+    }
+
     async fn delete(&self, key: &str, if_version: Option<Version>) -> Result<()> {
         if let Some(want) = &if_version {
-            // S3 has no conditional delete: emulate via HEAD + compare + DELETE.
-            // RACE: a concurrent writer could replace the object between HEAD
-            // and DELETE. Acceptable for walgit's lease-guarded semantics.
-            let head = self.head(key).await?;
-            match head {
-                None => return Err(StoreError::NotFound { key: key.into() }),
-                Some(meta) if &meta.version != want => {
-                    return Err(StoreError::PreconditionFailed {
-                        key: key.into(),
-                        current: Some(meta.version),
-                    });
-                }
-                _ => {}
+            // Native conditional delete (`If-Match`, S3 conditional requests):
+            // the version check and the delete are one atomic operation — a
+            // concurrent rewrite (D42's race-1 version bump) makes this fail
+            // with 412 instead of deleting the referenced object. The HEAD is
+            // only for the contract's NotFound-vs-412 distinction on absent keys.
+            if self.head(key).await?.is_none() {
+                return Err(StoreError::NotFound { key: key.into() });
             }
+            return match self
+                .client
+                .delete_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .if_match(want.as_str())
+                .send()
+                .await
+            {
+                Ok(_) => Ok(()),
+                Err(e) => {
+                    let code = err_code(&e).unwrap_or("");
+                    if matches!(code, "PreconditionFailed" | "ConditionalRequestConflict") {
+                        let current = self.head(key).await.ok().flatten().map(|m| m.version);
+                        Err(StoreError::PreconditionFailed {
+                            key: key.into(),
+                            current,
+                        })
+                    } else {
+                        Err(classify_error("s3 conditional delete", &e))
+                    }
+                }
+            };
         }
 
         let resp = self
@@ -528,6 +716,9 @@ impl ObjectStore for S3Store {
                                     size: u64::try_from(obj.size().unwrap_or(0))
                                         .map_err(StoreError::other)?,
                                     version: Version::new(etag.as_deref().unwrap_or("")),
+                                    updated: obj
+                                        .last_modified()
+                                        .and_then(|t| SystemTime::try_from(*t).ok()),
                                 })
                             })
                             .collect();
@@ -803,6 +994,7 @@ impl ObjectStore for S3Store {
             key: dest.into(),
             size: total,
             version: Version::new(etag.as_deref().unwrap_or("")),
+            updated: None,
         })
     }
 
@@ -961,6 +1153,7 @@ impl S3Store {
             key: key.into(),
             size: len,
             version: Version::new(etag.as_deref().unwrap_or("")),
+            updated: None,
         })
     }
 

@@ -26,6 +26,11 @@ pub mod keys {
     pub const LOG_DIR: &str = "log/";
     pub const WAL_DIR: &str = "wal/";
     pub const CHECKPOINTS_DIR: &str = "checkpoints/";
+    /// Umbrella prefix for all derived render-cache objects.
+    pub const CACHE_DIR: &str = "cache/";
+    /// Shared render-cache entries the API writes and the sweep ages out
+    /// (`gc.render_cache_ttl`, no audit gate).
+    pub const RENDER_CACHE_DIR: &str = "cache/api/v1/";
     pub const LEASES_DIR: &str = "leases/";
     pub const BUNDLES_DIR: &str = "bundles/";
     pub const BUNDLE_LIST: &str = "bundles/list.pb";
@@ -37,6 +42,9 @@ pub mod keys {
     pub const LFS_DIR: &str = "lfs/objects/";
     /// Per-repo connectivity audit result (`FsckReport`). Overwritten, not WAL.
     pub const FSCK: &str = "fsck.pb";
+    /// D42: the connectivity-lite audit verdict (same `FsckReport` message,
+    /// separate object so the lite audit never resets full fsck's age clock).
+    pub const GC_AUDIT: &str = "gc/audit.pb";
     pub const CATALOG: &str = "meta/repos.pb";
     /// Per-repo push policy (JSON). Not on the WAL; CAS'd independently.
     pub const POLICY: &str = "policy.json";

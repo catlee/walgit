@@ -132,6 +132,14 @@ pub enum Unit {
     /// side-file, CAS it into the manifest — every other host then downloads
     /// it on its next sync instead of rebuilding 60 M entries per fetch.
     RevIndex(String),
+    /// D42: reachability repack (`compact --base`) for a repository without a
+    /// weekly base rebuild, every `gc.repack_interval`.
+    FullRepack(String),
+    /// D42: the demand-driven connectivity-lite audit — the last sweep left
+    /// candidates gated and no audit has run since.
+    GcAudit(String),
+    /// D42: the bucket janitor, every `gc.sweep_interval`.
+    GcSweep(String),
     /// Connectivity audit due (`maintenance.fsck_interval`): none recorded, older than the
     /// interval, or a repair landed since the last audit (re-verify).
     Fsck(String),
@@ -273,19 +281,34 @@ pub async fn next_unit(state: &Arc<AppState>, id: &RepoId) -> anyhow::Result<Uni
     {
         return Ok(Unit::Checkpoint(trigger.to_string()));
     }
-    // Integrity before everything else that builds on the object set.
+    // Integrity before everything else that builds on the object set. Both
+    // audits feed the same repair unit: full fsck (fsck.pb) and the gc
+    // connectivity-lite audit (gc/audit.pb, D42).
     let fsck = crate::ops::read_fsck(&handle).await.ok().flatten();
-    if let Some(f) = &fsck {
-        metrics::gauge!("walgit_repo_missing_objects", "repo" => id.to_string()).set(
-            if f.repaired_seq > 0 {
-                0.0
-            } else {
-                f.missing_total as f64
-            },
-        );
-        if !f.missing.is_empty() && f.repaired_seq == 0 && cfg.upstream.git.is_some() {
-            return Ok(Unit::Repair(f.missing_total));
-        }
+    // gc/audit.pb only exists (and only matters) with gc on: the disabled
+    // path pays no extra plan-pass GET.
+    let gc_audit = if cfg.gc.enabled {
+        crate::ops::read_gc_audit(&handle).await.ok().flatten()
+    } else {
+        None
+    };
+    let missing_now = [&fsck, &gc_audit]
+        .into_iter()
+        .flatten()
+        .filter(|r| r.repaired_seq == 0)
+        .map(|r| r.missing_total)
+        .max();
+    if fsck.is_some() || gc_audit.is_some() {
+        metrics::gauge!("walgit_repo_missing_objects", "repo" => id.to_string())
+            .set(missing_now.unwrap_or(0) as f64);
+    }
+    // Repair has two sources: superseded packs still in the bucket (D42,
+    // needs gc on) and upstream.git. Due when either could help.
+    if let Some(n) = missing_now
+        && n > 0
+        && (cfg.upstream.git.is_some() || cfg.gc.enabled)
+    {
+        return Ok(Unit::Repair(n));
     }
     if cfg.bundles.enabled && state.cfg.has_role(walgit_config::Role::Bundle) {
         let ctx = plan_context(state, &handle);
@@ -391,6 +414,91 @@ pub async fn next_unit(state: &Arc<AppState>, id: &RepoId) -> anyhow::Result<Uni
             && handle.local().pack_path(&oid).exists()
         {
             return Ok(Unit::RevIndex(p.checksum.clone()));
+        }
+    }
+    // D42 gc units. The full repack slots in with compaction-shaped work; the
+    // audit is demand-driven by the last sweep's gated candidates; the sweep
+    // runs on its own cadence. Scheduling hints (last sweep, gated) live in
+    // memory only — losing them on a restart re-runs one idempotent unit; the
+    // durable truth is the bucket. All lowest-priority except fsck.
+    if cfg.gc.enabled {
+        // Full repack: repos whose weekly BaseRebuild already does this skip
+        // it. The clock is the tier-2 base's own upload time (a fresh base is
+        // what a full repack produces); never-repacked repos arm from the
+        // checkpoint's first_state_at so a brand-new repo is not immediately
+        // rewritten.
+        let weekly_covered = cfg.bundles.enabled
+            && state.cfg.has_role(walgit_config::Role::Bundle)
+            && cfg
+                .bundles
+                .strategy
+                .iter()
+                .any(|s| s.kind == walgit_config::BundleKind::Full);
+        if !cfg.gc.repack_interval.is_zero()
+            && !weekly_covered
+            && state.cfg.has_role(walgit_config::Role::Compact)
+            && handle.packs_fit()
+            && !handle.manifest().packs.is_empty()
+        {
+            let m = handle.manifest();
+            let base = m.packs.iter().find(|p| {
+                p.tier == 2 && p.kind == walgit_proto::v1::PackKind::Objects as i32
+            });
+            let memory_age = state
+                .gc_sched
+                .lock()
+                .get(&id.to_string())
+                .and_then(|s| s.last_full_repack)
+                .map(|at| at.elapsed());
+            let baseline = match base {
+                Some(p) => walgit_store::ObjectStore::head(
+                    handle.store(),
+                    &walgit_proto::keys::pack_key(&p.checksum),
+                )
+                .await
+                .ok()
+                .flatten()
+                .and_then(|meta| meta.updated),
+                None => m
+                    .checkpoint
+                    .as_ref()
+                    .and_then(|c| c.first_state_at)
+                    .map(|t| walgit_proto::time::to_system(&t)),
+            };
+            if let Some(t) = baseline {
+                let age = memory_age.unwrap_or_else(|| {
+                    SystemTime::now().duration_since(t).unwrap_or_default()
+                });
+                if age >= cfg.gc.repack_interval {
+                    return Ok(Unit::FullRepack(format!(
+                        "last full repack {}h ago",
+                        age.as_secs() / 3600
+                    )));
+                }
+            }
+        }
+        let sched = state.gc_sched.lock().get(&id.to_string()).copied();
+        // Demand-driven audit: the last sweep on this host left gated
+        // candidates and no audit has run since.
+        if let Some(sched) = &sched
+            && sched.gated > 0
+            && !sched.audited_since_sweep
+        {
+            return Ok(Unit::GcAudit(format!(
+                "{} candidate(s) gated on a fresh audit",
+                sched.gated
+            )));
+        }
+        // The sweep, on cadence.
+        let due = match sched.and_then(|s| s.last_sweep) {
+            None => Some("never swept (this process)".to_string()),
+            Some(at) if at.elapsed() >= cfg.gc.sweep_interval => {
+                Some(format!("last sweep {}h ago", at.elapsed().as_secs() / 3600))
+            }
+            Some(_) => None,
+        };
+        if let Some(why) = due {
+            return Ok(Unit::GcSweep(why));
         }
     }
     // Lowest priority: the audit itself. Only where the whole pack set is local
@@ -591,6 +699,9 @@ pub async fn run_pass(state: &Arc<AppState>) -> anyhow::Result<PassReport> {
                 Unit::Repair(_) => ("repair", None, None),
                 Unit::BaseRebuild(s, slot) => ("base-rebuild", Some(s.clone()), Some(*slot)),
                 Unit::RevIndex(_) => ("rev-index", None, None),
+                Unit::FullRepack(_) => ("full-repack", None, None),
+                Unit::GcAudit(_) => ("gc-audit", None, None),
+                Unit::GcSweep(_) => ("gc-sweep", None, None),
                 Unit::Fsck(_) => ("fsck", None, None),
                 Unit::Idle | Unit::NotAssigned => unreachable!(),
             };
@@ -632,12 +743,21 @@ pub async fn run_pass(state: &Arc<AppState>) -> anyhow::Result<PassReport> {
                         ok
                     }
                     Unit::Repair(_) => run_op(state, &id, "repair", HashMap::new()).await,
-                    Unit::BaseRebuild(..) => {
+                    // A full repack is the base-rebuild machinery on a gc
+                    // cadence: same op; the fresh base's own upload time is the
+                    // clock (D42).
+                    Unit::BaseRebuild(..) | Unit::FullRepack(_) => {
                         let mut params = HashMap::new();
                         params.insert("base".to_string(), "1".to_string());
                         params.insert("force".to_string(), "1".to_string());
                         let ok = run_op(state, &id, "compact", params).await;
                         if ok {
+                            state
+                                .gc_sched
+                                .lock()
+                                .entry(id.to_string())
+                                .or_default()
+                                .last_full_repack = Some(Instant::now());
                             report.compactions += 1;
                         }
                         ok
@@ -646,6 +766,43 @@ pub async fn run_pass(state: &Arc<AppState>) -> anyhow::Result<PassReport> {
                         let mut params = HashMap::new();
                         params.insert("pack".to_string(), checksum.clone());
                         run_op(state, &id, "rev-index", params).await
+                    }
+                    Unit::GcAudit(_) => {
+                        let value = run_op_value(state, &id, "gc-audit", HashMap::new()).await;
+                        let written = value
+                            .as_ref()
+                            .and_then(|v| v.get("written"))
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false);
+                        if written {
+                            let mut sched = state.gc_sched.lock();
+                            sched.entry(id.to_string()).or_default().audited_since_sweep = true;
+                        }
+                        written
+                    }
+                    Unit::GcSweep(_) => {
+                        let value = run_op_value(state, &id, "gc-sweep", HashMap::new()).await;
+                        let Some(v) = value.as_ref().filter(|v| v.is_object()) else {
+                            // Lease-held Null or failure: still pending next pass.
+                            return false;
+                        };
+                        let gated = v
+                            .get("gated")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0);
+                        let remaining = v
+                            .get("remaining")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0);
+                        let mut sched = state.gc_sched.lock();
+                        let e = sched.entry(id.to_string()).or_default();
+                        // Capped backlog and audit-gated work retry next pass,
+                        // not max_deletes_per_pass per day. After the demanded
+                        // audit, last_sweep=None drives the deleting sweep.
+                        e.last_sweep = (gated == 0 && remaining == 0).then(Instant::now);
+                        e.gated = gated;
+                        e.audited_since_sweep = false;
+                        true
                     }
                     Unit::Fsck(why) => {
                         let mut params = HashMap::new();
@@ -804,4 +961,21 @@ async fn run_op_value(
         }
         None => None,
     }
+}
+
+
+/// D42: per-repo gc scheduling hints, memory-only (see `AppState::gc_sched`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GcSched {
+    /// Last successful full repack in this process. A no-op rebuild keeps the
+    /// same base checksum/mtime; this hint re-arms it instead of selecting it
+    /// every pass and starving audit/sweep/fsck. Restart may do one redundant
+    /// no-op, safe direction.
+    pub last_full_repack: Option<Instant>,
+    /// When the last sweep ran in this process (cadence).
+    pub last_sweep: Option<Instant>,
+    /// Candidates the last sweep left gated on a missing/stale clean audit.
+    pub gated: u64,
+    /// An audit ran after that sweep (clears the demand).
+    pub audited_since_sweep: bool,
 }

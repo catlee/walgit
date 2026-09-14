@@ -594,6 +594,10 @@ pub async fn run_with_store(
     let up_started = Instant::now();
     let mut pack_refs = Vec::new();
     let mut first_upload_done = false;
+    // Every object the manifest will reference. The final pre-CAS fence uses
+    // this list so a days-long import pause cannot leave even a successfully
+    // uploaded object old enough for a concurrent sweep to adopt/delete.
+    let mut published_objects: Vec<(String, PathBuf, Option<&'static str>, usize)> = Vec::new();
     for p in &packs {
         let mut objects: Vec<(String, PathBuf, u64, Option<&'static str>, usize)> = vec![(
             keys::pack_key(&p.checksum),
@@ -636,6 +640,13 @@ pub async fn run_with_store(
                 4,
             ));
         }
+        published_objects.extend(
+            objects
+                .iter()
+                .map(|(key, path, _, content_type, stripes)| {
+                    (key.clone(), path.clone(), *content_type, *stripes)
+                }),
+        );
         // Which of them are already there: the marker first (no request), then HEADs in parallel.
         let unknown: Vec<&(String, PathBuf, u64, Option<&'static str>, usize)> = objects
             .iter()
@@ -661,12 +672,23 @@ pub async fn run_with_store(
         }
         for (key, path, size, ct, par) in &objects {
             if present.contains(key) {
-                println!("{key} already in store, skipping upload");
-                report.skipped += 1;
-                if !marker.uploaded.contains(key) {
-                    marker.uploaded.push(key.clone());
+                // Adopt-without-upload: fence FIRST (D42 race 1). The object
+                // may have sat unreferenced past gc.retention (a resumed
+                // import paused for weeks, or a re-import of identical
+                // content); the pre-CAS version bump 412s any sweep already
+                // holding its old version and refreshes the mtime so it is no
+                // sweep candidate. Fencing before the CAS means a crash at any
+                // later point leaves the reference protected. Vanished (the
+                // sweep won) → fall through and upload.
+                if matches!(repo_store.bump_version(key).await, Ok(Some(_))) {
+                    println!("{key} already in store, skipping upload (version fenced)");
+                    report.skipped += 1;
+                    if !marker.uploaded.contains(key) {
+                        marker.uploaded.push(key.clone());
+                    }
+                    continue;
                 }
-                continue;
+                eprintln!("{key} vanished since its presence probe (gc race); uploading");
             }
             let t = Instant::now();
             walgit_store::util::put_file_parallel(
@@ -806,6 +828,10 @@ pub async fn run_with_store(
         bundle_key,
         created_at: Some(time::now()),
         writer: format!("walgit-import@{}", hostname()),
+        // Becomes part of the committed checkpoint chain only if the manifest
+        // CAS below lands; an abandoned import checkpoint is unreachable and
+        // can never become GC/materialize's horizon.
+        previous: base_manifest.as_ref().and_then(|m| m.checkpoint.clone()),
     };
     let cp_key = keys::checkpoint_key(seq);
     repo_store
@@ -842,6 +868,29 @@ pub async fn run_with_store(
         revision: base_manifest.as_ref().map_or(0, |m| m.revision) + 1,
         settings: None,
     };
+    // Final PRE-CAS fence over every referenced object. Adopted objects were
+    // already bumped at skip time; bumping again is harmless. New uploads may
+    // have sat here through an arbitrarily long pause. If a sweep won, restore
+    // from the local bytes before making the reference visible.
+    for (key, path, content_type, stripes) in &published_objects {
+        if matches!(repo_store.bump_version(key).await, Ok(Some(_))) {
+            continue;
+        }
+        walgit_store::util::put_file_parallel(
+            &repo_store,
+            key,
+            path,
+            PutOptions {
+                mode: PutMode::Overwrite,
+                immutable: true,
+                content_type: *content_type,
+            },
+            *stripes,
+        )
+        .await
+        .with_context(|| format!("restoring {key} before the manifest CAS"))?;
+    }
+
     let mode = match base_version {
         Some(v) => PutMode::Update(v),
         None => PutMode::Create,

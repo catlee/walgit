@@ -177,6 +177,7 @@ async fn write_checkpoint_inner(handle: &RepoHandle) -> Result<CheckpointRef, Wa
         bundle_key: String::new(),
         created_at: Some(created_at),
         writer: writer.clone(),
+        previous: manifest.checkpoint.clone(),
     };
     let cp_key = keys::checkpoint_key(seq);
     let cp_bytes = checkpoint.encode_to_vec();

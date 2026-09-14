@@ -30,6 +30,7 @@ machines whose "disk" is 20 GiB of tmpfs, next to a long tail of small repositor
 | `docs/LFS.md` | Anyone touching LFS (`lfs.rs`, `lfs_upstream.rs`) or importing a repository whose LFS history lives elsewhere. |
 | `docs/INTEGRITY.md` | Anyone touching import, the maintainer's `fsck`/`repair` units, or seeing `connectivity: missing object` on a push. |
 | `docs/EVENTS.md` | Anyone changing WAL-derived ref events, the webhook bridge, consumer semantics or event cursors. |
+| `docs/GC.md` | Anyone touching object deletion, retention, the gc units, the connectivity audit, or a publisher that references a bucket object without uploading it. Design of record (D42). |
 | `docs/CONTRACT.md` | When you touch a crate boundary. The cross-crate contract; *extend, don't rename*; code wins where they differ. |
 | `docs/reference/cursor-git-at-any-scale.md` | The source design, verbatim. Read once before touching WAL/publish/sync/placement. |
 | `docs/patches/README.md` | Git client patches (bundle filter matching) and the gate for advertising filtered bundle families together. |
@@ -210,7 +211,8 @@ runtime** and never takes the refs phase's lock (D19). `check_fits` refuses to p
 - **A fold never touches the base or a history pack** (`--keep-pack`), **a base is rebuilt only by the weekly
   unit / `compact --base`**, and **a rebuild supersedes every other live pack** by the manifest, not by what git
   happened to delete.
-- Superseded packs are retained `compaction.retention_superseded` (provenance window) then GC'd.
+- Superseded packs are retained `gc.retention` (provenance window) then deleted by the gc-sweep unit,
+  gated on a clean connectivity audit (D42, `docs/GC.md`).
 
 ### 2.5b Self-healing by construction (D22)
 Everything the maintainer produces — checkpoints, bundles per slot, compactions, retention — is a **pure function
@@ -338,7 +340,7 @@ decision in §4 — or the PR is; never "fix later".
   `-Authorization` / `-Key` and the edge slices and caches. `deploy/nginx.conf.example` is the reference; nothing
   in `crates/` knows a hostname.
 - **D24** **Per-repo settings live in the WAL.** `RepoSettings {toml, revision, author, updated_at, message}` — a
-  TOML document restricted to `[bundles]`, `[maintenance]`, `[compaction]`, `[upstream]` (≤ 16 KiB) — is published
+  TOML document restricted to `[bundles]`, `[maintenance]`, `[compaction]`, `[gc]`, `[upstream]` (≤ 16 KiB) — is published
   as a `SETTINGS` log entry **and inline on `manifest.pb`** (every refs-level sync sees the effective config at no
   extra round trip). Effective config = host `walgit.toml` ⊕ env ⊕ settings (`Config::with_settings`). Validated at
   publish; invalid = 400, nothing published. Surface: `GET|PUT|DELETE /{o}/{r}/api/settings`, `…/effective`,
@@ -399,6 +401,19 @@ decision in §4 — or the PR is; never "fix later".
   + chain) is for clones, **`bundles/catchup`** (no fulls) is what recipes record in `fetch.bundleURI`. Measured: a
   catch-up is exactly the slots missed; for a client fetching several times a day, upload-pack's thin pack is
   smaller than an hourly bundle — bundles pay off for fresh clones and far-behind clients.
+
+- **D42** (2026-09-08) **GC fails closed and never depends on an upstream** (`docs/GC.md`). Two maintainer
+  units: **full-repack** (`compact --base` on `gc.repack_interval` where the weekly unit does not already do
+  it) and **gc-sweep**. The sweep is stateless: follow the manifest's committed checkpoint chain to the
+  retention horizon, replay the retained WAL to the current manifest, and protect every pack introduced by
+  that provenance; any missing checkpoint/log, replay mismatch or absent clean `gc/audit.pb` verdict at the
+  current manifest head means no WAL deletion. The audit runs at Serve level on any host (commits/trees from
+  D18 history, blob existence from live `.idx` files, zero base-pack data reads). Repair first sources missing
+  objects from the frozen superseded packs; `upstream.git` is fallback only. A publisher that adopts an
+  existing content-addressed object fences it **before** its manifest CAS with `ObjectStore::bump_version`,
+  so an in-flight conditional delete sees 412; presence alone proves nothing. GCS generations and memory
+  versions are monotonic. S3 uses native `If-Match` delete and an adjacent-different ETag representation flip;
+  small S3 objects have the documented period-two ETag limitation in `docs/GC.md §6`.
 
 Decision identifiers are stable; gaps in the numbering are intentional.
 

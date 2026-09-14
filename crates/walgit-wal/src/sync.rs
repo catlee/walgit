@@ -24,6 +24,19 @@ impl ReadGuard<'_> {
     pub fn local(&self) -> &LocalRepo {
         &self.handle.local
     }
+
+    /// D42: one coherent audit root snapshot. A regular `ReadGuard` only pins
+    /// pack removal; refs may still advance under `sync_mutex`. Capture the
+    /// manifest and the local refs while holding that mutex so the audit never
+    /// labels roots from seq N+1 with indexes from manifest N (false-clean).
+    pub async fn audit_snapshot(
+        &self,
+    ) -> Result<(Arc<Manifest>, walgit_git::RefSnapshotData), crate::WalError> {
+        let _guard = self.handle.sync_mutex.lock().await;
+        let manifest = self.handle.manifest.read().clone();
+        let refs = self.handle.local.refs()?;
+        Ok((manifest, refs))
+    }
 }
 
 /// How much of the WAL a sync must bring to the local copy.

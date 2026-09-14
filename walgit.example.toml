@@ -152,8 +152,22 @@ trigger_packs = 16                # compact when this many tier-0 packs exist
 trigger_bytes = "1GiB"            # or when tier-0 pack bytes exceed this (either way: at least 2 fresh packs; the base/history
                                   # pack are never folded; a base is rebuilt only by the weekly unit / `walgit compact --base`)
 lease_ttl = "10m"                 # compaction lease TTL
-retention_superseded = "7d"       # keep old packs for provenance / rewind
 engine = "git"                    # "git" (gix cannot delta-compress)
+
+# ---------------------------------------------------------------------------
+# garbage collection (docs/GC.md, D42): full-repack + gc-sweep maintainer units.
+# The sweep follows committed checkpoint provenance and replays the retained WAL;
+# deletion needs a clean connectivity-lite audit at the current manifest head.
+# Missing provenance or no clean audit means no WAL deletion (fail closed).
+[gc]
+enabled = true
+sweep_interval = "24h"            # bucket-janitor cadence per assigned repo
+repack_interval = "30d"           # reachability repack for repos without weekly base rebuilds; 0 = off
+retention = "7d"                  # provenance/rewind window: unreferenced objects younger than this are kept
+                                  # (was compaction.retention_superseded; `walgit wal materialize --at-seq` works within it)
+render_cache_ttl = "7d"           # cache/api/v1/* entries older than this are swept (no gate)
+max_deletes_per_pass = 1000       # bounded unit; leftovers next pass
+lease_ttl = "10m"                 # leases/gc.pb: one audit or sweep unit at a time per repo
 
 # ---------------------------------------------------------------------------
 # bundle-uri strategies (docs/BUNDLE_URI_DESIGN.md §3-§4 is the design of record)

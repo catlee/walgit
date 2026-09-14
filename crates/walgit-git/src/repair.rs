@@ -1,11 +1,13 @@
-//! Fetch exactly the given objects from an upstream git remote and pack them.
+//! Turn a missing-objects list into one publishable pack.
 //!
 //! The maintainer's `repair` unit (desired state: every object reachable from
-//! refs is in a live pack) turns an fsck missing list into one pack that the
-//! WAL publishes as a COMPACT entry. Scratch repository per call (`dir`), never
-//! the serving copy; the remote must serve wants by SHA (GitHub does, for
-//! commits, trees and blobs reachable from any ref — verified 2026-08-21).
-//! Token (optional) goes through a one-shot credential helper, never argv.
+//! refs is in a live pack) recovers objects into a scratch git dir — from
+//! superseded packs still in the bucket (`walgit_wal::gc::recover_from_superseded`,
+//! written as loose objects) and/or fetched from an upstream remote
+//! ([`fetch_oids`]; the remote must serve wants by SHA — GitHub does, for
+//! commits, trees and blobs reachable from any ref, verified 2026-08-21) —
+//! then packs exactly the requested oids ([`pack_oids`]) for the WAL to
+//! publish as a COMPACT entry. Never the serving copy.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -13,55 +15,60 @@ use std::process::Stdio;
 use crate::GitError;
 
 pub struct RepairPack {
-    /// Scratch directory holding the repo and the pack; the caller removes it after publishing.
-    pub dir: PathBuf,
     pub pack: PathBuf,
     pub idx: PathBuf,
     pub objects: u64,
     pub bytes: u64,
 }
 
-/// Fetch every oid in `oids` from `upstream` into a scratch repo under `dir`,
-/// then `pack-objects` exactly those oids into `pack-<sha>.pack` + `.idx`.
-/// Wants are sent in batches (argv length, server limits).
-pub async fn fetch_objects_as_pack(
-    upstream: &str,
-    token: Option<&str>,
-    oids: &[String],
-    dir: &Path,
-) -> Result<RepairPack, GitError> {
-    let scratch = dir.join(format!("repair-{}", uuid::Uuid::new_v4()));
-    tokio::fs::create_dir_all(&scratch)
-        .await
-        .map_err(GitError::Io)?;
-    let git = |args: &[&str]| {
-        let mut c = tokio::process::Command::new("git");
-        c.arg("--git-dir")
-            .arg(&scratch)
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        c
-    };
-    let ok = |out: std::process::Output, what: &str| -> Result<std::process::Output, GitError> {
-        if out.status.success() {
-            Ok(out)
-        } else {
-            Err(GitError::Subprocess {
-                cmd: what.to_string(),
-                status: out.status.code(),
-                stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
-            })
-        }
-    };
+fn git_cmd(git_dir: &Path, args: &[&str]) -> tokio::process::Command {
+    let mut c = tokio::process::Command::new("git");
+    c.arg("--git-dir")
+        .arg(git_dir)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    c
+}
+
+fn ok(out: std::process::Output, what: &str) -> Result<std::process::Output, GitError> {
+    if out.status.success() {
+        Ok(out)
+    } else {
+        Err(GitError::Subprocess {
+            cmd: what.to_string(),
+            status: out.status.code(),
+            stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        })
+    }
+}
+
+/// A bare scratch repository at `dir` (idempotent: re-init of an existing
+/// scratch keeps its objects — a resumed repair reuses what it recovered).
+pub async fn init_scratch(dir: &Path) -> Result<(), GitError> {
+    tokio::fs::create_dir_all(dir).await.map_err(GitError::Io)?;
     ok(
-        git(&["init", "-q", "--bare"])
+        git_cmd(dir, &["init", "-q", "--bare"])
             .output()
             .await
             .map_err(GitError::Io)?,
         "git init",
     )?;
+    Ok(())
+}
+
+const FETCH_BATCH: usize = 500;
+
+/// Fetch every oid in `oids` from `upstream` into the scratch at `git_dir`.
+/// Wants are sent in batches (argv length, server limits). A refused want
+/// surfaces later: [`pack_oids`] verifies every requested object.
+pub async fn fetch_oids(
+    git_dir: &Path,
+    upstream: &str,
+    token: Option<&str>,
+    oids: &[String],
+) -> Result<(), GitError> {
     let helper = token
         .map(|t| {
             format!(
@@ -70,7 +77,6 @@ pub async fn fetch_objects_as_pack(
             )
         })
         .unwrap_or_default();
-
     for chunk in oids.chunks(FETCH_BATCH) {
         let mut args: Vec<&str> = vec![
             "-c",
@@ -92,19 +98,28 @@ pub async fn fetch_objects_as_pack(
         ]);
         args.extend(chunk.iter().map(String::as_str));
         ok(
-            git(&args).output().await.map_err(GitError::Io)?,
+            git_cmd(git_dir, &args).output().await.map_err(GitError::Io)?,
             "git fetch <upstream> <oids>",
         )?;
     }
+    Ok(())
+}
 
-    // Pack exactly the requested objects (no --revs: no closure, what was asked).
-    let pack_base = scratch.join("pack");
-    let mut child = git(&[
-        "pack-objects",
-        "--no-reuse-delta",
-        "--compression=6",
-        pack_base.to_str().unwrap_or("pack"),
-    ])
+/// `pack-objects` exactly `oids` (no closure) from the scratch at `git_dir`
+/// into `pack-<sha>.pack` + `.idx` beside it. **Every requested object must be
+/// in the resulting pack** — a hole silently left open is worse than a failed
+/// unit.
+pub async fn pack_oids(git_dir: &Path, oids: &[String]) -> Result<RepairPack, GitError> {
+    let pack_base = git_dir.join("pack");
+    let mut child = git_cmd(
+        git_dir,
+        &[
+            "pack-objects",
+            "--no-reuse-delta",
+            "--compression=6",
+            pack_base.to_str().unwrap_or("pack"),
+        ],
+    )
     .stdin(Stdio::piped())
     .spawn()
     .map_err(GitError::Io)?;
@@ -130,13 +145,12 @@ pub async fn fetch_objects_as_pack(
             "pack-objects printed no checksum: {sha:?}"
         )));
     }
-    let pack = scratch.join(format!("pack-{sha}.pack"));
-    let idx = scratch.join(format!("pack-{sha}.idx"));
+    let pack = git_dir.join(format!("pack-{sha}.pack"));
+    let idx = git_dir.join(format!("pack-{sha}.idx"));
     let bytes = tokio::fs::metadata(&pack)
         .await
         .map_err(GitError::Io)?
         .len();
-    // Every requested object must be in the pack (a want the server refused is a hole left open).
     let index = gix_pack::index::File::at(&idx, gix_hash::Kind::Sha1)
         .map_err(|e| GitError::Gix(Box::new(e)))?;
     let mut objects = 0u64;
@@ -151,12 +165,11 @@ pub async fn fetch_objects_as_pack(
     }
     if let Some(m) = first_missing {
         return Err(GitError::Protocol(format!(
-            "upstream served {objects} of {} requested objects (first missing: {m})",
+            "recovered {objects} of {} requested objects (first missing: {m})",
             oids.len()
         )));
     }
     Ok(RepairPack {
-        dir: scratch,
         pack,
         idx,
         objects,
@@ -164,4 +177,32 @@ pub async fn fetch_objects_as_pack(
     })
 }
 
-const FETCH_BATCH: usize = 500;
+/// Write one loose object into the scratch (skip if present). Standalone
+/// (no `LocalRepo`): the scratch is a bare `git init` dir, not a serving copy.
+pub fn write_loose(
+    git_dir: &Path,
+    kind: gix_object::Kind,
+    oid: &gix_hash::oid,
+    data: &[u8],
+) -> Result<(), GitError> {
+    use gix_object::Write as _;
+    let hex = oid.to_hex().to_string();
+    let path = git_dir
+        .join("objects")
+        .join(hex.get(..2).ok_or_else(|| GitError::InvalidInput("short object ID".into()))?)
+        .join(hex.get(2..).ok_or_else(|| GitError::InvalidInput("short object ID".into()))?);
+    if path.exists() {
+        return Ok(());
+    }
+    let store = gix_odb::loose::Store::at(
+        git_dir.join("objects"),
+        gix_odb::loose::Options {
+            object_hash: oid.kind(),
+            ..Default::default()
+        },
+    );
+    store
+        .write_buf_with_known_id(kind, data, oid.to_owned())
+        .map_err(GitError::Gix)?;
+    Ok(())
+}

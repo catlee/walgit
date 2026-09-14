@@ -18,6 +18,7 @@ pub struct Config {
     pub cache: CacheConfig,
     pub wal: WalConfig,
     pub compaction: CompactionConfig,
+    pub gc: GcConfig,
     pub bundles: BundlesConfig,
     pub maintenance: MaintenanceConfig,
     pub placement: PlacementConfig,
@@ -522,11 +523,41 @@ pub struct CompactionConfig {
     pub trigger_bytes: ByteSize,
     #[serde(with = "humantime_serde")]
     pub lease_ttl: Duration,
-    /// Keep superseded packs and old index generations for this long (provenance/rewind).
-    #[serde(with = "humantime_serde")]
-    pub retention_superseded: Duration,
     /// Use upstream git for delta compression (`git repack`); gix does not delta-compress.
     pub engine: RepackEngine,
+}
+
+/// D42 (`docs/GC.md`): the two GC maintainer units and the audit gate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct GcConfig {
+    /// Both units and the audit gate.
+    pub enabled: bool,
+    /// gc-sweep (bucket janitor) cadence per assigned repository (§4).
+    #[serde(with = "humantime_serde")]
+    pub sweep_interval: Duration,
+    /// Reachability repack for repositories that never get a weekly base
+    /// rebuild (§3); 0 = off. Effective force-push grace = this + `retention`.
+    #[serde(with = "humantime_serde")]
+    pub repack_interval: Duration,
+    /// Provenance/rewind window: unreferenced store objects younger than this
+    /// are never deleted (`walgit wal materialize --at-seq` works within it).
+    /// Was `compaction.retention_superseded`; now it is enforced.
+    #[serde(with = "humantime_serde")]
+    pub retention: Duration,
+    /// Shared render-cache entries (`cache/api/v1/*`) older than this are
+    /// swept; no audit gate (they are derived state).
+    #[serde(with = "humantime_serde")]
+    pub render_cache_ttl: Duration,
+    /// Bounded unit: at most this many deletes per sweep pass; leftovers are
+    /// missing work for the next pass (D22).
+    pub max_deletes_per_pass: usize,
+    /// TTL of `leases/gc.pb`, held for one audit or sweep unit (like the
+    /// compaction lease, no heartbeat). Set it above the longest expected
+    /// unit; a unit that outruns the TTL is still safe (CAS verdict,
+    /// conditional deletes), just repeatable by another instance.
+    #[serde(with = "humantime_serde")]
+    pub lease_ttl: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -820,7 +851,7 @@ fn default_true() -> bool {
 }
 
 /// D24: the top-level sections a repository's settings may override.
-pub const SETTINGS_SECTIONS: &[&str] = &["bundles", "maintenance", "compaction", "upstream"];
+pub const SETTINGS_SECTIONS: &[&str] = &["bundles", "maintenance", "compaction", "gc", "upstream"];
 /// D24: maximum size of a settings document.
 pub const SETTINGS_MAX_BYTES: usize = 16 * 1024;
 
@@ -864,6 +895,23 @@ impl Config {
         let mut doc: toml::Table = toml::Table::try_from(self).context("serializing config")?;
         merge(&mut doc, &overrides);
         let cfg: Config = doc.try_into().context("settings: applying")?;
+        // D42: checkpoints and log segments take no audit gate — the retention
+        // window and the sweep cadence are their protection. A repository
+        // admin may lengthen both but never push them under an hour; rig-style
+        // tiny windows are a host operator's choice (walgit.toml), not a
+        // per-repo setting.
+        if let Some(toml::Value::Table(g)) = overrides.get("gc") {
+            const FLOOR: Duration = Duration::from_hours(1);
+            for (key, value) in [
+                ("retention", cfg.gc.retention),
+                ("sweep_interval", cfg.gc.sweep_interval),
+            ] {
+                anyhow::ensure!(
+                    !g.contains_key(key) || value >= FLOOR,
+                    "settings: gc.{key} may not be set below 1h per repository (host config can)"
+                );
+            }
+        }
         cfg.validate()
             .context("settings: validating the effective config")?;
         Ok(cfg)
@@ -1153,8 +1201,20 @@ impl Default for CompactionConfig {
             trigger_packs: 16,
             trigger_bytes: ByteSize::gib(1),
             lease_ttl: Duration::from_mins(10),
-            retention_superseded: Duration::from_hours(168),
             engine: RepackEngine::Git,
+        }
+    }
+}
+impl Default for GcConfig {
+    fn default() -> Self {
+        GcConfig {
+            enabled: true,
+            sweep_interval: Duration::from_hours(24),
+            repack_interval: Duration::from_hours(30 * 24),
+            retention: Duration::from_hours(168),
+            render_cache_ttl: Duration::from_hours(168),
+            max_deletes_per_pass: 1000,
+            lease_ttl: Duration::from_mins(10),
         }
     }
 }
@@ -1876,6 +1936,19 @@ checkpoints = false
         assert_eq!(eff.bundles.min_commits, 3);
         assert!(!eff.bundles.main_only);
         assert!(!eff.maintenance.checkpoints);
+        // [gc] is per-repo overridable like [compaction] (D42).
+        let eff = base
+            .with_settings("[gc]\nretention = \"14d\"\nrepack_interval = \"0s\"\n")
+            .unwrap();
+        assert_eq!(eff.gc.retention, std::time::Duration::from_hours(14 * 24));
+        assert!(eff.gc.repack_interval.is_zero());
+        assert_eq!(eff.gc.sweep_interval, base.gc.sweep_interval);
+        // … but never below the 1h floor: retention and cadence are the only
+        // protection for gateless checkpoint/log deletion (D42).
+        for bad in ["[gc]\nretention = \"0s\"\n", "[gc]\nsweep_interval = \"5m\"\n"] {
+            let e = base.with_settings(bad).unwrap_err().to_string();
+            assert!(e.contains("below 1h"), "{e}");
+        }
         assert_eq!(
             eff.bundles.strategy.len(),
             base.bundles.strategy.len(),

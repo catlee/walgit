@@ -3,6 +3,7 @@
 
 mod checkpoint;
 mod error;
+pub mod gc;
 mod handle;
 pub mod lockwait;
 mod log_reader;

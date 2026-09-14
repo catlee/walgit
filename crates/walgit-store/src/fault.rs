@@ -458,6 +458,18 @@ impl ObjectStore for FaultStore {
         }
     }
 
+    async fn bump_version(&self, key: &str) -> Result<Option<ObjectMeta>> {
+        match self.decide("bump", key, true, false, false).await {
+            Decision::Hang => hang_forever().await,
+            Decision::ErrBefore => Err(self.retryable("bump", key, "before")),
+            Decision::ErrAfter => {
+                self.inner.bump_version(key).await?;
+                Err(self.retryable("bump", key, "after (applied)"))
+            }
+            _ => self.inner.bump_version(key).await,
+        }
+    }
+
     async fn delete(&self, key: &str, if_version: Option<Version>) -> Result<()> {
         let conditional = if_version.is_some();
         match self.decide("delete", key, true, conditional, false).await {

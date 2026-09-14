@@ -41,7 +41,7 @@ const SWR: &str = "private, max-age=0, stale-while-revalidate=60";
 const DEFAULT_PAGE: usize = 100;
 const MAX_PAGE: usize = 1000;
 /// Store key prefix (inside the repo prefix) of the shared render cache.
-const SHARED_CACHE_PREFIX: &str = "cache/api/v1/";
+const SHARED_CACHE_PREFIX: &str = walgit_proto::keys::RENDER_CACHE_DIR;
 
 #[derive(Serialize, Clone)]
 pub(crate) struct RefInfo {

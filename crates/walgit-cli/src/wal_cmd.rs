@@ -234,17 +234,32 @@ pub async fn materialize_at(
 
     let local = walgit_git::LocalRepo::init(out, id, format)?;
 
-    // Start from the newest checkpoint at or before `at_seq` when the
-    // log before it has been folded (min_seq), else from seq 0.
+    // Start from the newest RETAINED checkpoint at or before `at_seq`, not
+    // merely the manifest's current one: GC keeps a horizon checkpoint plus
+    // newer checkpoints and trims earlier logs. A rewind between horizon and
+    // current must start from that older retained checkpoint (D42).
     let mut start_seq = 0u64;
     let mut pack_set: Vec<walgit_proto::v1::PackRef> = Vec::new();
-    if let Some(cp) = manifest.checkpoint.as_ref().filter(|c| c.seq <= at_seq) {
+    let mut checkpoint = manifest.checkpoint.clone();
+    let mut selected: Option<(u64, walgit_proto::v1::Checkpoint)> = None;
+    let mut seen = std::collections::HashSet::new();
+    while let Some(cp_ref) = checkpoint.take() {
+        if !seen.insert(cp_ref.seq) {
+            bail!("checkpoint chain cycle at seq {}", cp_ref.seq);
+        }
         let (_, bytes) = handle
             .store()
-            .get_bytes(&cp.key)
+            .get_bytes(&cp_ref.key)
             .await?
-            .ok_or_else(|| anyhow::anyhow!("checkpoint object {} missing", cp.key))?;
+            .ok_or_else(|| anyhow::anyhow!("committed checkpoint {} missing", cp_ref.key))?;
         let cpo = walgit_proto::v1::Checkpoint::decode(bytes.as_ref())?;
+        if cp_ref.seq <= at_seq {
+            selected = Some((cp_ref.seq, cpo));
+            break;
+        }
+        checkpoint.clone_from(&cpo.previous);
+    }
+    if let Some((cp_seq, cpo)) = selected {
         let (_, rb) = handle
             .store()
             .get_bytes(&cpo.refs_key)
@@ -253,9 +268,9 @@ pub async fn materialize_at(
         let snap = walgit_proto::v1::RefSnapshot::decode(rb.as_ref())?;
         local.load_ref_snapshot(&snap)?;
         pack_set = cpo.packs.clone();
-        start_seq = cp.seq;
+        start_seq = cp_seq;
         info!(
-            seq = cp.seq,
+            seq = cp_seq,
             packs = pack_set.len(),
             refs = snap.refs.len(),
             "starting from checkpoint"
@@ -370,6 +385,7 @@ pub async fn materialize_at(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use walgit_store::ObjectStore;
 
     fn run_git(dir: &std::path::Path, args: &[&str]) -> String {
         let out = std::process::Command::new("git")
@@ -462,6 +478,12 @@ mod tests {
                 .unwrap();
             prev = c.clone();
             tips.push(c);
+            // Retained historical checkpoint: later GC may delete log/1, but
+            // materialize at seq 2 must find this checkpoint rather than only
+            // considering the manifest's current checkpoint (seq 4).
+            if i == 1 {
+                handle.write_checkpoint().await.unwrap();
+            }
         }
         // Compact into a base (seq 4) and checkpoint there.
         let repack = handle
@@ -481,6 +503,12 @@ mod tests {
             .unwrap();
         assert_eq!(base_seq, 4);
         handle.write_checkpoint().await.unwrap();
+        // Simulate GC trimming the log before the retained seq-2 checkpoint.
+        handle
+            .store()
+            .delete(&walgit_proto::keys::log_segment_key(1), None)
+            .await
+            .unwrap();
 
         // Cold registry (no local packs at all).
         let cache2 = tempfile::tempdir().unwrap();

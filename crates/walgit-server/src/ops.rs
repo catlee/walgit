@@ -12,7 +12,7 @@ use prost::Message;
 use serde::Serialize;
 use walgit_config::Config;
 use walgit_git::{RepackMode, RepackOptions, RepoId};
-use walgit_store::ObjectStoreExt;
+use walgit_store::{ObjectStore, ObjectStoreExt};
 use walgit_wal::RepoHandle;
 
 use crate::AppState;
@@ -59,10 +59,32 @@ pub const OPS: &[OpSpec] = &[
         mutating: false,
     },
     OpSpec {
+        id: "gc-audit",
+        label: "GC audit",
+        description: "Connectivity-lite audit (docs/GC.md §2): walk refs → commits → trees from the local \
+                      odb (history + fresh packs) and probe every reachable object against the live packs' \
+                      .idx files — no pack data reads, runs on a tmpfs host. Records the verdict at \
+                      gc/audit.pb; a clean audit is what lets the gc sweep delete superseded packs.",
+        params: &[],
+        mutating: false,
+    },
+    OpSpec {
+        id: "gc-sweep",
+        label: "GC sweep",
+        description: "Bucket janitor (docs/GC.md §4): delete superseded packs, old checkpoints, trimmed log \
+                      segments, orphans and stale render-cache entries past gc.retention. WAL objects are \
+                      deleted only behind a clean connectivity audit taken after they matured (never \
+                      over-delete, fail closed). Bounded by gc.max_deletes_per_pass.",
+        params: &[],
+        mutating: true,
+    },
+    OpSpec {
         id: "repair",
         label: "Repair",
-        description: "Fetch the objects the last fsck found missing from upstream.git and publish them \
-                      as a pack (COMPACT entry, no ref change).",
+        description: "Bring the objects the last audit found missing back into the live set: first out of \
+                      superseded packs still in the bucket (the gc gate froze them, docs/GC.md §6), then \
+                      from upstream.git for whatever predates GC. Published as one pack (COMPACT entry, \
+                      no ref change).",
         params: &[],
         mutating: true,
     },
@@ -185,17 +207,83 @@ pub async fn start(
 }
 
 /// The last connectivity audit of `handle`'s repository, if any.
+/// D42: `leases/gc.pb` — one audit or sweep unit at a time per repository
+/// (placement usually guarantees this; the lease covers deploy overlap and
+/// overlapping maintain globs). Held for the duration of the unit and
+/// released explicitly at the end, exactly like the compaction lease; TTL is
+/// the backstop on a crash. No heartbeat: the lease is a dedup optimization,
+/// not a correctness mechanism — a unit that outruns the TTL is safe because
+/// the audit verdict is a CAS write and every sweep delete is conditional and
+/// re-checked against a fresh manifest (docs/GC.md §5). Worst case on a lost
+/// lease is another instance repeating idempotent work.
+async fn gc_lease(
+    handle: &RepoHandle,
+) -> Result<Option<walgit_store::coord::LeaseGuard>, String> {
+    let ttl = handle.effective_config().gc.lease_ttl;
+    let lease_store: walgit_store::DynStore = Arc::new(handle.store().clone());
+    walgit_store::coord::try_acquire(
+        lease_store,
+        &walgit_proto::keys::lease_key("gc"),
+        walgit_store::coord::instance_id(),
+        "gc",
+        ttl,
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
 pub async fn read_fsck(
     handle: &RepoHandle,
 ) -> Result<Option<walgit_proto::v1::FsckReport>, String> {
+    read_report(handle, walgit_proto::keys::FSCK).await
+}
+
+/// D42: the connectivity-lite audit's verdict (`gc/audit.pb`).
+pub async fn read_gc_audit(
+    handle: &RepoHandle,
+) -> Result<Option<walgit_proto::v1::FsckReport>, String> {
+    read_report(handle, walgit_proto::keys::GC_AUDIT).await
+}
+
+async fn read_report(
+    handle: &RepoHandle,
+    key: &str,
+) -> Result<Option<walgit_proto::v1::FsckReport>, String> {
     use walgit_store::ObjectStoreExt;
-    match handle.store().get_bytes(walgit_proto::keys::FSCK).await {
+    match handle.store().get_bytes(key).await {
         Ok(Some((_, bytes))) => walgit_proto::v1::FsckReport::decode(bytes.as_ref())
             .map(Some)
             .map_err(|e| e.to_string()),
         Ok(None) => Ok(None),
         Err(e) => Err(e.to_string()),
     }
+}
+
+async fn mark_reports_repaired(
+    handle: &RepoHandle,
+    fsck: &Option<walgit_proto::v1::FsckReport>,
+    gc_audit: &Option<walgit_proto::v1::FsckReport>,
+    seq: u64,
+) -> Result<(), String> {
+    for (key, report) in [
+        (walgit_proto::keys::FSCK, fsck),
+        (walgit_proto::keys::GC_AUDIT, gc_audit),
+    ] {
+        let Some(report) = report else { continue };
+        if report.repaired_seq > 0 {
+            continue;
+        }
+        let done = walgit_proto::v1::FsckReport {
+            repaired_seq: seq,
+            ..report.clone()
+        };
+        handle
+            .store()
+            .put_bytes(key, done.encode_to_vec(), walgit_store::PutMode::Overwrite)
+            .await
+            .map_err(|e| format!("writing {key}: {e}"))?;
+    }
+    Ok(())
 }
 
 fn flag(params: &HashMap<String, String>, key: &str) -> bool {
@@ -298,92 +386,357 @@ async fn run(
                 Err(summary)
             }
         }
+        "gc-audit" => {
+            let Some(lease) = gc_lease(&handle).await? else {
+                return Ok(("gc lease held by another instance; skipped".into(), serde_json::Value::Null));
+            };
+            let audit_version = walgit_store::coord::get_message::<walgit_proto::v1::FsckReport>(
+                handle.store(),
+                walgit_proto::keys::GC_AUDIT,
+            )
+            .await
+            .map_err(|e| e.to_string())?
+            .map(|(meta, _)| meta.version);
+            let guard = handle.sync().await.map_err(|e| e.to_string())?;
+            let (manifest, roots) = guard
+                .audit_snapshot()
+                .await
+                .map_err(|e| e.to_string())?;
+            let seq = manifest.head_seq;
+            // Precondition: the walk reads commit/tree contents from the D18
+            // history pack; its install may still be a background task. Defer
+            // rather than fail a walk that would only error on the first read.
+            for p in &manifest.packs {
+                if p.kind == walgit_proto::v1::PackKind::History as i32
+                    && !handle.local().pack_path(
+                        &walgit_git::gix_hash::ObjectId::from_hex(p.checksum.as_bytes())
+                            .map_err(|e| e.to_string())?,
+                    ).exists()
+                {
+                    return Err(format!(
+                        "history pack {} not installed locally yet (background install); audit deferred",
+                        p.checksum
+                    ));
+                }
+            }
+            log(format!(
+                "local copy at seq {} (manifest head {}), opening {} live pack index(es)",
+                seq,
+                manifest.head_seq,
+                manifest.packs.len()
+            ));
+            let t0 = Instant::now();
+            let indexes = walgit_wal::gc::live_indexes(
+                &handle,
+                &manifest,
+                &walgit_wal::progress::Reporter::none(),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            let local = handle.local().clone();
+            let join = tokio::task::spawn_blocking(move || {
+                let walk_log = move |s: String| {
+                    let _ = tx.send(s);
+                };
+                let probe = |oid: &walgit_git::gix_hash::oid| indexes.contains(oid);
+                walgit_git::audit::connectivity_walk_with_refs(
+                    &local,
+                    &roots,
+                    &probe,
+                    FSCK_MISSING_LIST_MAX,
+                    &walk_log,
+                )
+            });
+            while let Some(line) = rx.recv().await {
+                log(line);
+            }
+            let out = join
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?;
+            drop(guard);
+            // The verdict lives at gc/audit.pb — same message as fsck.pb, a
+            // separate object so this audit never resets full fsck's age clock.
+            let report = walgit_proto::v1::FsckReport {
+                seq,
+                at: Some(walgit_proto::time::now()),
+                host: crate::maintain::host_name(state),
+                missing_total: out.missing_total,
+                missing: out.missing.iter().map(ToString::to_string).collect(),
+                problems: 0,
+                elapsed_secs: t0.elapsed().as_secs_f64(),
+                repaired_seq: 0,
+            };
+            // CAS against the version read before the walk: if this host lost
+            // the gc lease (e.g. heartbeat response lost, next heartbeat 412)
+            // and another host wrote a newer finding, this stale walk must not
+            // overwrite it. A 412 means the newer verdict wins.
+            let mode = match audit_version {
+                Some(v) => walgit_store::PutMode::Update(v),
+                None => walgit_store::PutMode::Create,
+            };
+            let written = match handle
+                .store()
+                .put(
+                    walgit_proto::keys::GC_AUDIT,
+                    walgit_store::PutBody::Bytes(report.encode_to_vec().into()),
+                    mode.into(),
+                )
+                .await
+            {
+                Ok(_) => true,
+                Err(walgit_store::StoreError::PreconditionFailed { .. }) => {
+                    tracing::warn!(repo = %id, seq, "gc audit verdict moved during the walk; discarding stale result");
+                    false
+                }
+                Err(e) => return Err(format!("writing gc/audit.pb: {e}")),
+            };
+            if written {
+                metrics::gauge!("walgit_repo_missing_objects", "repo" => id.to_string())
+                    .set(out.missing_total as f64);
+            }
+            metrics::histogram!("walgit_gc_audit_seconds").record(t0.elapsed().as_secs_f64());
+            tracing::info!(repo = %id, seq, missing = out.missing_total, commits = out.commits, trees = out.trees, elapsed_ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX), "gc audit recorded");
+            let summary = if out.missing_total == 0 {
+                format!(
+                    "audit clean at seq {seq}: {} commits, {} trees, {} blob probes ({:.0}s)",
+                    out.commits,
+                    out.trees,
+                    out.blob_probes,
+                    t0.elapsed().as_secs_f64()
+                )
+            } else {
+                format!(
+                    "audit at seq {seq}: {} object(s) missing from the live pack set",
+                    out.missing_total
+                )
+            };
+            // Missing objects are a finding (the repair unit is the response
+            // and the sweep gate stays closed), never a failure of the unit.
+            let value = serde_json::json!({
+                "seq": seq,
+                "commits": out.commits,
+                "trees": out.trees,
+                "blob_probes": out.blob_probes,
+                "missing": out.missing_total,
+                "written": written,
+            });
+            // Confirmed release: awaited so the next unit's acquire never
+            // races an in-flight best-effort delete from the guard's Drop.
+            if let Err(e) = lease.release().await {
+                log(format!("gc lease release failed: {e}"));
+            }
+            Ok((summary, value))
+        }
+        "gc-sweep" => {
+            let cfg = handle.effective_config();
+            if !cfg.gc.enabled {
+                return Ok(("gc disabled ([gc] enabled = false)".into(), serde_json::Value::Null));
+            }
+            let Some(lease) = gc_lease(&handle).await? else {
+                return Ok(("gc lease held by another instance; skipped".into(), serde_json::Value::Null));
+            };
+            let t0 = Instant::now();
+            let out = walgit_wal::gc::sweep(&handle, std::time::SystemTime::now(), log)
+                .await
+                .map_err(|e| e.to_string())?;
+            for (kind, n) in &out.deleted_by_kind {
+                metrics::counter!("walgit_gc_deleted_total", "repo" => id.to_string(), "kind" => *kind)
+                    .increment(*n);
+            }
+            metrics::counter!("walgit_gc_deleted_bytes_total", "repo" => id.to_string())
+                .increment(out.deleted_bytes);
+            metrics::gauge!("walgit_gc_gated", "repo" => id.to_string()).set(out.gated as f64);
+            metrics::histogram!("walgit_gc_sweep_seconds").record(t0.elapsed().as_secs_f64());
+            tracing::info!(repo = %id, listed = out.listed, referenced = out.referenced, horizon_seq = out.horizon_seq, candidates = out.candidates, gated = out.gated, deleted = out.deleted, bytes = out.deleted_bytes, remaining = out.remaining, "gc sweep done");
+            let summary = format!(
+                "swept {} object(s) against horizon checkpoint {}: {} referenced, {} candidate(s), {} gated, {} deleted ({} bytes){}",
+                out.listed,
+                out.horizon_seq,
+                out.referenced,
+                out.candidates,
+                out.gated,
+                out.deleted,
+                out.deleted_bytes,
+                if out.remaining > 0 {
+                    format!(", {} left for the next pass", out.remaining)
+                } else {
+                    String::new()
+                }
+            );
+            let value = serde_json::to_value(&out).map_err(|e| e.to_string())?;
+            if let Err(e) = lease.release().await {
+                log(format!("gc lease release failed: {e}"));
+            }
+            Ok((summary, value))
+        }
         "repair" => {
             // Desired state: every object reachable from refs is in a live pack.
-            // Input: fsck.pb's missing list (the audit); source: upstream.git
-            // (GitHub serves blob/tree wants by SHA); output: one pack published as
-            // a COMPACT entry superseding nothing (exactly what `wal add-pack --tier 0`
-            // did by hand for a large repository's 1,952 blobs, the original large-repository measurements).
+            // Input: the audits' missing lists; sources, in order: superseded
+            // packs still in the bucket (frozen by the gc gate exactly while a
+            // finding stands — D42, no upstream dependency), then upstream.git
+            // (GitHub serves blob/tree wants by SHA) for holes that predate GC
+            // (an import that never uploaded the objects). Output: one pack
+            // published as a COMPACT entry superseding nothing.
             let cfg = handle.effective_config();
-            let upstream = cfg
-                .upstream
-                .git
-                .clone()
-                .ok_or("repair: no upstream.git for this repository")?;
-            let fsck = read_fsck(&handle)
-                .await?
-                .ok_or("repair: no fsck.pb (run fsck first)")?;
-            if fsck.missing.is_empty() {
+            let upstream = cfg.upstream.git.clone();
+            // Findings come from either audit: full fsck (fsck.pb) or the gc
+            // connectivity-lite audit (gc/audit.pb, D42). Union their lists.
+            let fsck = read_fsck(&handle).await?;
+            let gc_audit = read_gc_audit(&handle).await?;
+            if fsck.is_none() && gc_audit.is_none() {
+                return Err("repair: no audit verdict (run fsck or gc-audit first)".into());
+            }
+            let mut missing: Vec<String> = [&fsck, &gc_audit]
+                .into_iter()
+                .flatten()
+                .filter(|r| r.repaired_seq == 0)
+                .flat_map(|r| r.missing.iter().cloned())
+                .collect();
+            missing.sort_unstable();
+            missing.dedup();
+            if missing.is_empty() {
                 return Ok((
                     "nothing to repair".into(),
                     serde_json::json!({"missing": 0}),
                 ));
             }
-            if fsck.missing_total as usize > fsck.missing.len() {
-                log(format!(
-                    "fsck listed {} of {} missing objects; repairing those, the next fsck finds the rest",
-                    fsck.missing.len(),
-                    fsck.missing_total
-                ));
-            }
-            let token = match cfg.upstream.token_env.as_deref() {
-                Some(name) => Some(
-                    state
-                        .lfs_upstream
-                        .secret(name)
-                        .await
-                        .map_err(|e| format!("upstream token: {e}"))?,
-                ),
-                None => None,
-            };
-            let t0 = Instant::now();
-            log(format!(
-                "fetching {} object(s) from {upstream}",
-                fsck.missing.len()
-            ));
-            let pack = walgit_git::repair::fetch_objects_as_pack(
-                &upstream,
-                token.as_deref(),
-                &fsck.missing,
-                &state.cfg.cache.dir.join("repair"),
+            // Revalidate the stale audit list against the CURRENT live pack
+            // indexes before looking at superseded packs or upstream: an
+            // operator may already have restored the objects with `wal
+            // add-pack`. Such a finding must complete/re-audit, not select a
+            // failing Repair unit forever.
+            let guard = handle.sync().await.map_err(|e| e.to_string())?;
+            let manifest = guard.manifest();
+            let indexes = walgit_wal::gc::live_indexes(
+                &handle,
+                &manifest,
+                &walgit_wal::progress::Reporter::none(),
             )
             .await
-            .map_err(|e| format!("repair fetch: {e}"))?;
+            .map_err(|e| e.to_string())?;
+            missing.retain(|hex| {
+                walgit_git::gix_hash::ObjectId::from_hex(hex.as_bytes())
+                    .is_ok_and(|oid| !indexes.contains(&oid))
+            });
+            let current_seq = manifest.head_seq;
+            drop(guard);
+            if missing.is_empty() {
+                mark_reports_repaired(&handle, &fsck, &gc_audit, current_seq).await?;
+                return Ok((
+                    format!("audit finding already satisfied by the live pack set at seq {current_seq}; marked for re-audit"),
+                    serde_json::json!({"missing": 0, "seq": current_seq, "already_satisfied": true}),
+                ));
+            }
+            let missing_total = [&fsck, &gc_audit]
+                .into_iter()
+                .flatten()
+                .filter(|r| r.repaired_seq == 0)
+                .map(|r| r.missing_total)
+                .max()
+                .unwrap_or(0);
+            if missing_total as usize > missing.len() {
+                log(format!(
+                    "the audits listed {} of {} missing objects; repairing those, the next audit finds the rest",
+                    missing.len(),
+                    missing_total
+                ));
+            }
+            let t0 = Instant::now();
+            // A stable scratch per repository: a retried repair reuses the
+            // downloaded indexes and already-recovered loose objects.
+            let scratch = state
+                .cfg
+                .cache
+                .dir
+                .join("repair")
+                .join(id.owner())
+                .join(format!("{}.git", id.name()));
+            walgit_git::repair::init_scratch(&scratch)
+                .await
+                .map_err(|e| format!("repair scratch: {e}"))?;
+
+            // Source 1: superseded packs still in the bucket. The whole
+            // index/decode/write path runs on walgit-wal's bulk runtime.
+            let recovery = walgit_wal::gc::recover_from_superseded(
+                handle.clone(),
+                missing.clone(),
+                scratch.clone(),
+            )
+            .await
+            .map_err(|e| format!("repair recovery: {e}"))?;
             log(format!(
-                "packed {} object(s), {} bytes in {:.1}s; publishing",
+                "recovered {} of {} from {} superseded pack(s)",
+                recovery.found.len(),
+                missing.len(),
+                recovery.packs_probed
+            ));
+
+            // Source 2: upstream.git for the remainder.
+            if !recovery.remainder.is_empty() {
+                let Some(upstream) = &upstream else {
+                    return Err(format!(
+                        "repair: {} object(s) in no unreferenced pack and no upstream.git to fetch them from (recovered {} that will publish on the next attempt with a source for the rest)",
+                        recovery.remainder.len(),
+                        recovery.found.len()
+                    ));
+                };
+                let token = match cfg.upstream.token_env.as_deref() {
+                    Some(name) => Some(
+                        state
+                            .lfs_upstream
+                            .secret(name)
+                            .await
+                            .map_err(|e| format!("upstream token: {e}"))?,
+                    ),
+                    None => None,
+                };
+                log(format!(
+                    "fetching {} object(s) from {upstream}",
+                    recovery.remainder.len()
+                ));
+                walgit_git::repair::fetch_oids(
+                    &scratch,
+                    upstream,
+                    token.as_deref(),
+                    &recovery.remainder,
+                )
+                .await
+                .map_err(|e| format!("repair fetch: {e}"))?;
+            }
+
+            let pack = walgit_git::repair::pack_oids(&scratch, &missing)
+                .await
+                .map_err(|e| format!("repair pack: {e}"))?;
+            log(format!(
+                "packed {} object(s), {} bytes in {:.1}s ({} recovered from superseded packs, {} fetched); publishing",
                 pack.objects,
                 pack.bytes,
-                t0.elapsed().as_secs_f64()
+                t0.elapsed().as_secs_f64(),
+                recovery.found.len(),
+                recovery.remainder.len(),
             ));
             let seq = handle
                 .add_pack(&pack.pack, &pack.idx, 0, None)
                 .await
                 .map_err(|e| format!("publish: {e}"))?;
-            let _ = tokio::fs::remove_dir_all(&pack.dir).await;
-            // Record the repair on the audit so the unit is not due again until the
-            // next fsck re-verifies (it will: the plan compares seqs).
-            let done = walgit_proto::v1::FsckReport {
-                repaired_seq: seq,
-                ..fsck
-            };
-            handle
-                .store()
-                .put_bytes(
-                    walgit_proto::keys::FSCK,
-                    done.encode_to_vec(),
-                    walgit_store::PutMode::Overwrite,
-                )
-                .await
-                .map_err(|e| format!("writing fsck.pb: {e}"))?;
+            let _ = tokio::fs::remove_dir_all(&scratch).await;
+            // Record the repair on both audits so the unit is not due again
+            // until the next audit re-verifies (it will: the plan compares seqs).
+            mark_reports_repaired(&handle, &fsck, &gc_audit, seq).await?;
             metrics::counter!("walgit_repair_objects_total", "repo" => id.to_string())
                 .increment(pack.objects);
-            tracing::info!(repo = %id, seq, objects = pack.objects, bytes = pack.bytes, %upstream, elapsed_ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX), "repair published");
+            tracing::info!(repo = %id, seq, objects = pack.objects, bytes = pack.bytes, recovered = recovery.found.len(), fetched = recovery.remainder.len(), elapsed_ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX), "repair published");
             Ok((
                 format!(
-                    "repaired {} object(s) ({} bytes) from upstream at seq {seq}",
-                    pack.objects, pack.bytes
+                    "repaired {} object(s) ({} bytes) at seq {seq}: {} from superseded packs, {} from upstream",
+                    pack.objects,
+                    pack.bytes,
+                    recovery.found.len(),
+                    recovery.remainder.len()
                 ),
-                serde_json::json!({"seq": seq, "objects": pack.objects, "bytes": pack.bytes}),
+                serde_json::json!({"seq": seq, "objects": pack.objects, "bytes": pack.bytes, "recovered": recovery.found.len(), "fetched": recovery.remainder.len()}),
             ))
         }
         "follow" => crate::follow::op(state, &handle, id, params, log).await,

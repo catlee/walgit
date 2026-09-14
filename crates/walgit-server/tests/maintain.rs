@@ -20,7 +20,8 @@ async fn pass_checkpoints_due_repos_refs_level_and_reports_tasks() -> anyhow::Re
     use walgit_server::maintain::{Unit, next_unit, run_pass};
 
     // Writer front: count trigger off, so nothing auto-checkpoints on push.
-    let front = step!("start front", Server::start())?;
+    // gc off: this test asserts the exact checkpoint/bundle unit sequence.
+    let front = step!("start front", Server::start_with_tweak(|c| c.gc.enabled = false))?;
     step!("put repo", front.put_repo("o", "r"))?;
     let src = tempfile::tempdir()?;
     git_in(src.path(), &["init", "-q", "-b", "main"])?;
@@ -108,6 +109,7 @@ async fn pass_checkpoints_due_repos_refs_level_and_reports_tasks() -> anyhow::Re
             c.wal.snapshot_every_entries = 0;
             c.compaction.enabled = false;
             c.bundles.enabled = true;
+            c.gc.enabled = false; // exact unit sequence asserted below
         })
     )?;
     // Priority loop: the first unit is the missing weekly slot (checkpoint is
@@ -280,6 +282,7 @@ async fn fsck_unit_records_missing_objects_and_repair_unit_fetches_them_from_ups
             c.compaction.enabled = false;
             c.bundles.enabled = false;
             c.maintenance.fsck_interval = std::time::Duration::from_hours(1);
+            c.gc.enabled = false; // this test is about the fsck/repair units
         })
     )?;
     step!("put repo", server.put_repo("o", "r"))?;
@@ -793,6 +796,7 @@ async fn one_pass_settles_all_closed_empty_slots() -> anyhow::Result<()> {
             c.compaction.enabled = false;
             c.maintenance.checkpoints = false;
             c.maintenance.fsck_interval = std::time::Duration::ZERO;
+            c.gc.enabled = false; // this test asserts the exact slot-settling unit sequence
             // weekly (full) + hourly on weekly: the closed hours since the weekly are empty.
             c.bundles.strategy.retain(|s| s.name != "daily");
             for s in &mut c.bundles.strategy {
@@ -1201,6 +1205,7 @@ async fn maintainer_builds_and_publishes_missing_rev_indexes() -> anyhow::Result
             c.compaction.enabled = false;
             c.bundles.enabled = false;
             c.maintenance.fsck_interval = std::time::Duration::ZERO;
+            c.gc.enabled = false; // this test is about rev-index priority
         })
     )?;
     step!("put repo", server.put_repo("o", "r"))?;

@@ -27,7 +27,8 @@ use std::sync::Arc;
 use bytes::Bytes;
 use futures::StreamExt;
 use walgit_store::{
-    DynStore, GetOptions, GetResult, PutBody, PutMode, PutOptions, StoreError, memory::MemoryStore,
+    DynStore, GetOptions, GetResult, ObjectStoreExt, PutBody, PutMode, PutOptions, StoreError,
+    memory::MemoryStore,
 };
 
 /// Run the full contract suite against `store` under `prefix`.
@@ -54,6 +55,47 @@ pub async fn run_contract(store: DynStore, prefix: &str) {
     test_large_streamed_roundtrip(&store, &p("large")).await;
     test_multipart_path(&store, &p("multi")).await;
     test_compose(&store, &p("compose")).await;
+    test_bump_version(&store, &p("bump")).await;
+}
+
+/// `bump_version`: the load-bearing property of D42's race-1 fence — every
+/// bump yields a version **different from the immediately preceding one**
+/// while the content stays byte-identical, and a conditional delete holding a
+/// pre-bump version fails. (Adjacent difference is the guarantee, not
+/// never-repeats: S3's content-derived `ETag`s give small objects only two
+/// representations, so its versions cycle with period 2. GCS generations and
+/// the memory counter are monotonic.) Absent key → `Ok(None)`.
+async fn test_bump_version(store: &DynStore, key: &str) {
+    let _ = store.delete(key, None).await;
+    assert!(
+        store.bump_version(key).await.expect("bump absent").is_none(),
+        "bump of an absent key must be None"
+    );
+    let m0 = put_bytes(store, key, b"fence me".as_slice(), PutMode::Create).await;
+    let mut prev = m0.version.clone();
+    for i in 0..3 {
+        let m = store
+            .bump_version(key)
+            .await
+            .expect("bump")
+            .expect("present");
+        assert_ne!(
+            m.version, prev,
+            "bump {i} did not change the version from its predecessor"
+        );
+        let (_, bytes) = store.get_bytes(key).await.expect("get").expect("present");
+        assert_eq!(&bytes[..], b"fence me", "bump {i} changed content");
+        prev = m.version;
+    }
+    // The fence itself: a delete conditional on a pre-bump version must fail
+    // and leave the object in place.
+    let err = store
+        .delete(key, Some(m0.version))
+        .await
+        .expect_err("stale conditional delete");
+    assert!(err.is_precondition_failed(), "{err}");
+    assert!(store.head(key).await.expect("head").is_some());
+    let _ = store.delete(key, None).await;
 }
 
 /// `compose`: a small header object followed by a body larger than S3's 5 MiB minimum
@@ -423,6 +465,15 @@ async fn test_head_and_absent(store: &DynStore, key: &str) {
         .expect("exists");
     assert_eq!(h.size, 9);
     assert_eq!(h.version, meta.version);
+    // HEAD reports the last-modified time (the GC sweep ages candidates with it).
+    let updated = h.updated.expect("head carries `updated`");
+    let age = std::time::SystemTime::now()
+        .duration_since(updated)
+        .unwrap_or_default();
+    assert!(
+        age < std::time::Duration::from_secs(600),
+        "`updated` should be recent, was {age:?} ago"
+    );
 
     let _ = store.delete(key, None).await;
 }
@@ -493,10 +544,15 @@ async fn test_list(store: &DynStore, base: &str) {
         put_bytes(store, k, b"x".as_slice(), PutMode::Create).await;
     }
 
-    // Full listing under base prefix, sorted.
+    // Full listing under base prefix, sorted; every entry carries `updated`
+    // (the GC sweep ages deletion candidates from the listing alone).
     let listed: Vec<String> = store
         .list(base, None)
-        .map(|r| r.expect("list item").key)
+        .map(|r| {
+            let m = r.expect("list item");
+            assert!(m.updated.is_some(), "list entry {} missing `updated`", m.key);
+            m.key
+        })
         .collect()
         .await;
     assert_eq!(listed, keys, "list should be sorted and match");
